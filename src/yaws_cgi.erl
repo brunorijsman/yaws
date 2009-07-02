@@ -1,14 +1,58 @@
 -module(yaws_cgi).
 -author('carsten@codimi.de').
 
+%% @@@ remove this
+-define(debug, true).
+
 -include("../include/yaws_api.hrl").
 -include("yaws_debug.hrl").
 -include("../include/yaws.hrl").
 
 -export([call_cgi/5, call_cgi/4, call_cgi/3, call_cgi/2]).
 
--export([cgi_worker/7]).
+-export([cgi_worker/7, fcgi_worker/7]).
 
+-define(FCGI_VERSION_1, 1).
+
+-define(FCGI_TYPE_BEGIN_REQUEST, 1).
+-define(FCGI_TYPE_ABORT_REQUEST, 2).
+-define(FCGI_TYPE_END_REQUEST, 3).
+-define(FCGI_TYPE_PARAMS, 4).
+-define(FCGI_TYPE_STDIN, 5).
+-define(FCGI_TYPE_STDOUT, 6).
+-define(FCGI_TYPE_STDERR, 7).
+-define(FCGI_TYPE_DATA, 8).
+-define(FCGI_TYPE_GET_VALUES, 9).
+-define(FCGI_TYPE_GET_VALUES_RESULT, 10).
+-define(FCGI_TYPE_UNKNOWN_TYPE, 11).
+
+% The FCGI implementation does not support handling concurrent requests over a connection; it creates a separate 
+% connection for each request. Hence, all application records have the same request-id, namely 1.
+%
+-define(FCGI_REQUEST_ID_MANAGEMENT, 0).
+-define(FCGI_REQUEST_ID_APPLICATION, 1).
+
+-define(FCGI_DONT_KEEP_CONN, 0).
+-define(FCGI_KEEP_CONN, 1).
+
+-define(FCGI_ROLE_RESPONDER, 1).
+-define(FCGI_ROLE_AUTHORIZER, 2).
+-define(FCGI_ROLE_FILTER, 3).
+
+-define(FCGI_STATUS_REQUEST_COMPLETE, 0).
+-define(FCGI_STATUS_CANT_MPX_CONN, 1).
+-define(FCGI_STATUS_OVERLOADED, 2).
+-define(FCGI_STATUS_UNKNOWN_ROLE, 3).
+
+%% @@TODO: Make the following things configurable:
+%%
+-define(FCGI_CONFIG_APPLICATION_SERVER_NAME, "localhost").
+-define(FCGI_CONFIG_APPLICATION_SERVER_PORT, 9999).
+-define(FCGI_CONFIG_CONNECT_TIMEOUT_MSECS, 1000).
+-define(FCGI_CONFIG_READ_TIMEOUT_MSECS, 1000).             %% @@@TODO: distinction between first read and additional reads
+-define(FCGI_CONFIG_KEEP_CONNECTION, true).
+
+-define(HTML_STATUS_INTERNAL_SERVER_ERROR, 500).           %% @@@TODO: Am I using this? 
 
 %%  TO DO:  Handle failure and timeouts.
 
@@ -83,7 +127,10 @@ start_worker(Arg, Exefilename, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
              undefined -> Arg#arg.pathinfo;
              OK -> OK
          end,
-    Worker = proc_lib:spawn(?MODULE, cgi_worker, 
+%% @@    
+%%     Worker = proc_lib:spawn(?MODULE, cgi_worker, 
+%%                             [self(), Arg, ExeFN, Scriptfilename, PI, ExtraEnv, SC]),
+    Worker = proc_lib:spawn(?MODULE, fcgi_worker, 
                             [self(), Arg, ExeFN, Scriptfilename, PI, ExtraEnv, SC]),
     Worker.
 
@@ -553,3 +600,251 @@ add_cgi_resp(Bin, Port) ->
 
 
 
+% @TODO: Figure out which of these we need: Exefilename, Scriptfilename, Pathinfo
+%
+fcgi_worker(Parent, Arg, ExeFileName, ScriptFileName, PathInfo, _ExtraEnv, _ServerConf) ->
+    ?Debug("[fcgi_worker] ExeFileName=~p ScriptFileName=~p PathInfo=~p~n", [ExeFileName, ScriptFileName, PathInfo]),
+    fgi_invoke_responder(Arg).
+
+
+    
+fgi_invoke_responder(Arg) -> 
+    try
+        Socket = fcgi_connect_to_application_server(Arg),        %% @@@ TODO: support timeout
+        try                
+            ok = fcgi_send_begin_request(Socket, ?FCGI_ROLE_RESPONDER, ?FCGI_CONFIG_KEEP_CONNECTION),
+            ok = fcgi_send_params(Socket, fcgi_responder_cgi_params(Arg)),
+%% @@@TODO: user ExtraEnv            
+%%             case responder_additional_params(Arg) of
+%%                 {ok, Params} -> ok = send_params(Socket, Params);
+%%                 no_data -> ok
+%%             end,
+            ok = fcgi_send_params(Socket, []),
+            case fcgi_responder_cgi_stdin_data(Arg) of
+                {ok, StdinData} -> ok = fcgi_send_stdin(Socket, StdinData);
+                no_data -> ok
+            end,
+            ok = fcgi_send_stdin(Socket, <<>>),
+            {_AppStatus, _ProtStatus, StdOutData, _StdErrData} = fcgi_receive_reply(Socket),           % TODO: do something with appstatus and stderrdata
+            ClientSocket = Arg#arg.clisock,
+            ok = gen_tcp:send(ClientSocket, StdOutData),        %% TODO: this is a short term hack?
+            ok                                                  %% TODO: explain
+        catch
+            exception:Reason1 ->
+                gen_tcp:close(Socket),
+                [{status, ?HTML_STATUS_INTERNAL_SERVER_ERROR}, {ehtml, {p, [], io:format("~p", [Reason1])}}]
+        end,
+        gen_tcp:close(Socket),
+        ok                          
+    catch
+        exception:Reason2 ->
+            [{status, ?HTML_STATUS_INTERNAL_SERVER_ERROR}, {ehtml, {p, [], io:format("~p", [Reason2])}}]
+    end.          
+
+
+
+fcgi_responder_cgi_params(Arg) ->
+    %% @@@TODO: replace with messages
+    no_data.
+
+
+
+fcgi_responder_cgi_stdin_data(_Arg) ->
+    %% @@@TODO: replace with messages
+    no_data.
+
+
+
+fcgi_choose_application_server(_Arg) ->
+    {?FCGI_CONFIG_APPLICATION_SERVER_NAME, ?FCGI_CONFIG_APPLICATION_SERVER_PORT}.
+
+
+
+fcgi_connect_to_application_server(Arg) ->
+    {Name, Port} = fcgi_choose_application_server(Arg),
+    Options = [binary, {packet, 0}, {active, false}],
+    case gen_tcp:connect(Name, Port, Options, ?FCGI_CONFIG_CONNECT_TIMEOUT_MSECS) of
+        {ok, Socket} ->
+            Socket;
+        {error, Reason} ->
+            throw({could_not_connect_to_application_server, Name, Port, Reason})
+    end.
+
+
+
+fcgi_send_begin_request(Socket, Role, KeepConnection) ->
+    Flags = case KeepConnection of
+        true -> ?FCGI_KEEP_CONN;
+        false -> ?FCGI_DONT_KEEP_CONN
+    end,
+    fcgi_send_record(Socket, ?FCGI_TYPE_BEGIN_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<Role:16, Flags:8, 0:40>>).
+
+
+
+fcgi_send_params(Socket, NameValueList) -> 
+    fcgi_send_record(Socket, ?FCGI_TYPE_PARAMS, ?FCGI_REQUEST_ID_APPLICATION, NameValueList).
+
+
+
+fcgi_send_stdin(Socket, Data) ->
+    fcgi_send_record(Socket, ?FCGI_TYPE_STDIN, ?FCGI_REQUEST_ID_APPLICATION, Data).
+
+
+
+fcgi_send_data(Socket, Data) ->
+    fcgi_send_record(Socket, ?FCGI_TYPE_DATA, ?FCGI_REQUEST_ID_APPLICATION, Data).
+
+
+
+fcgi_send_abort_request(Socket) ->
+    fcgi_send_record(Socket, ?FCGI_TYPE_ABORT_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<>>).
+
+
+
+fcgi_send_record(Socket, Type, RequestId, NameValueList) ->
+    EncodedRecord = fcgi_encode_record(Type, RequestId, NameValueList),
+    case gen_tcp:send(Socket, EncodedRecord) of
+        {error, Reason} ->
+            throw({error_sending_record, Reason});
+        ok ->
+            ok
+    end.
+
+
+
+fcgi_encode_record(Type, RequestId, NameValueList) 
+  when is_list(NameValueList) ->
+    fcgi_encode_record(Type, RequestId, fcgi_encode_name_value_list(NameValueList));
+    
+fcgi_encode_record(Type, RequestId, ContentData) 
+  when is_binary(ContentData) ->
+    Version = 1,
+    ContentLength = size(ContentData),
+    PaddingLength = if                              % Add padding bytes (if needed) to content bytes to make
+        ContentLength rem 8 == 0 ->                 % content plus padding a multiple of 8 bytes.
+            0;
+        true ->
+            8 - (ContentLength rem 8)
+    end,
+    PaddingData = <<0:(PaddingLength * 8)>>,
+    Reserved = 0,
+    <<Version:8,
+      Type:8,
+      RequestId:16,
+      ContentLength:16,
+      PaddingLength:8,
+      Reserved:8,                                           %% TODO: The spec is not clear where this goes
+      ContentData/binary,
+      PaddingData/binary>>.
+
+
+
+fcgi_encode_name_value_list(_NameValueList = []) ->
+    <<>>;
+
+fcgi_encode_name_value_list(_NameValueList = [{Name, Value} | Tail]) -> 
+    <<(fcgi_encode_name_value(Name,Value))/binary, (fcgi_encode_name_value_list(Tail))/binary>>.
+
+
+
+fcgi_encode_name_value(Name, _Value = undefined) ->
+    fcgi_encode_name_value(Name, "");
+
+fcgi_encode_name_value(Name, Value) when is_list(Name) and is_list(Value) ->
+    NameSize = length(Name),
+    NameSizeData = if
+        NameSize < 128 ->                         % If name size is < 128, encode it as one byte with the high bit 
+            <<NameSize:8>>;                       % clear. If the name size >= 128, encoded it as 4 bytes with the high
+        true ->                                   % bit set
+            <<(NameSize bor 16#80000000):32>>
+    end,
+    % Same encoding for the value size.
+    ValueSize = length(Value),
+    ValueSizeData = if
+        ValueSize < 128 -> 
+            <<ValueSize:8>>; 
+        true -> 
+            <<(ValueSize bor 16#80000000):32>>
+    end,
+    <<NameSizeData/binary,
+      ValueSizeData/binary,
+      (list_to_binary(Name))/binary,
+      (list_to_binary(Value))/binary>>.
+
+
+
+fcgi_receive_reply(Socket) ->
+    fcgi_receive_reply(Socket, [], []).
+
+fcgi_receive_reply(Socket, StdOutDataList, StdErrDataList) ->
+    {Type, ContentData} = fcgi_receive_record(Socket),
+    case Type of
+        ?FCGI_TYPE_END_REQUEST ->
+            <<AppStatus:32, ProtStatus:8, _Reserved:24>> = ContentData,
+            throw_if(ProtStatus < ?FCGI_STATUS_REQUEST_COMPLETE, {received_unknown_protocol_status, ProtStatus}),
+            throw_if(ProtStatus > ?FCGI_STATUS_UNKNOWN_ROLE, {received_unknown_protocol_status, ProtStatus}),
+            {AppStatus, ProtStatus, lists:reverse(StdOutDataList), lists:reverse(StdErrDataList)};
+        ?FCGI_TYPE_STDOUT ->
+            fcgi_receive_reply(Socket, [ContentData|StdOutDataList], StdErrDataList);
+        ?FCGI_TYPE_STDERR ->
+            fcgi_receive_reply(Socket, StdOutDataList, [ContentData|StdErrDataList]);
+        ?FCGI_TYPE_UNKNOWN_TYPE ->
+            <<Type:8, _Reserved:56>> = ContentData,
+            throw({application_reported_unknown_type, Type})
+    end.
+
+
+
+fcgi_receive_record(Socket) ->
+    case fcgi_receive_binary(Socket, 8, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
+        {error, Reason} ->
+            throw({unable_to_read_record_header, Reason});
+        {ok, <<Version:8, Type:8, RequestId:16, ContentLength:16, PaddingLength:8, _Reserved:8>>} ->
+            throw_if(Version /= 1, {received_unsupported_version, Version}),
+            case Type of
+                ?FCGI_TYPE_END_REQUEST ->
+                    throw_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, {unexpected_request_id, RequestId}),
+                    throw_if(ContentLength /= 8, {incorrect_content_length_for_end_request, ContentLength}),
+                    ok;
+                ?FCGI_TYPE_STDOUT ->
+                    throw_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, {unexpected_request_id, RequestId}),
+                    ok;
+                ?FCGI_TYPE_STDERR ->
+                    throw_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, {unexpected_request_id, RequestId}),
+                    ok;
+                ?FCGI_TYPE_UNKNOWN_TYPE ->
+                    throw_if(RequestId /= ?FCGI_REQUEST_ID_MANAGEMENT, {unexpected_request_id, RequestId}),
+                    throw_if(ContentLength /= 8, {incorrect_content_length_for_unknown_type, ContentLength}),
+                    ok;
+                OtherType ->
+                    throw({received_unexpected_type, OtherType})
+            end,
+            case fcgi_receive_binary(Socket, ContentLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
+                {error, Reason} ->
+                    throw({unable_to_read_content_data, Reason});
+                {ok, ContentData} ->
+                    case fcgi_receive_binary(Socket, PaddingLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
+                        {error, Reason} ->
+                            throw({unable_to_read_record_padding_data, Reason});
+                        {ok, _PaddingData} ->
+                            {Type, ContentData}                            
+                    end
+            end
+    end.
+
+
+fcgi_receive_binary(_Socket, Length, _Timeout) when Length == 0 ->
+    {ok, <<>>};
+
+fcgi_receive_binary(Socket, Length, Timeout) ->
+    gen_tcp:recv(Socket, Length, Timeout).
+
+
+
+throw_if(Condition, Exception) ->
+    if 
+        Condition ->
+            throw(Exception);
+        true ->
+            ok
+    end.
