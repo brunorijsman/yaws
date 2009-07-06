@@ -9,90 +9,17 @@
 -include("../include/yaws.hrl").
 
 -export([call_cgi/5, call_cgi/4, call_cgi/3, call_cgi/2]).
+-export([call_fcgi_responder/3, call_fcgi_responder/2, call_fcgi_responder/1]).
 
--export([cgi_worker/7, fcgi_worker/7]).
+-export([cgi_worker/7, fcgi_worker/5]).
 
--define(FCGI_VERSION_1, 1).
+%%======================================================================================================================
+%% Code which is shared between CGI and FastCGI    
+%%======================================================================================================================
 
--define(FCGI_TYPE_BEGIN_REQUEST, 1).
--define(FCGI_TYPE_ABORT_REQUEST, 2).
--define(FCGI_TYPE_END_REQUEST, 3).
--define(FCGI_TYPE_PARAMS, 4).
--define(FCGI_TYPE_STDIN, 5).
--define(FCGI_TYPE_STDOUT, 6).
--define(FCGI_TYPE_STDERR, 7).
--define(FCGI_TYPE_DATA, 8).
--define(FCGI_TYPE_GET_VALUES, 9).
--define(FCGI_TYPE_GET_VALUES_RESULT, 10).
--define(FCGI_TYPE_UNKNOWN_TYPE, 11).
+-define(ASCII_NEW_LINE, 10).
+-define(ASCII_CARRIAGE_RETURN, 13).
 
-% The FCGI implementation does not support handling concurrent requests over a connection; it creates a separate 
-% connection for each request. Hence, all application records have the same request-id, namely 1.
-%
--define(FCGI_REQUEST_ID_MANAGEMENT, 0).
--define(FCGI_REQUEST_ID_APPLICATION, 1).
-
--define(FCGI_DONT_KEEP_CONN, 0).
--define(FCGI_KEEP_CONN, 1).
-
--define(FCGI_ROLE_RESPONDER, 1).
--define(FCGI_ROLE_AUTHORIZER, 2).
--define(FCGI_ROLE_FILTER, 3).
-
--define(FCGI_STATUS_REQUEST_COMPLETE, 0).
--define(FCGI_STATUS_CANT_MPX_CONN, 1).
--define(FCGI_STATUS_OVERLOADED, 2).
--define(FCGI_STATUS_UNKNOWN_ROLE, 3).
-
-%% @@TODO: Make the following things configurable:
-%%
--define(FCGI_CONFIG_APPLICATION_SERVER_NAME, "localhost").
--define(FCGI_CONFIG_APPLICATION_SERVER_PORT, 9999).
--define(FCGI_CONFIG_CONNECT_TIMEOUT_MSECS, 1000).
--define(FCGI_CONFIG_READ_TIMEOUT_MSECS, 1000).             %% @@@TODO: distinction between first read and additional reads
--define(FCGI_CONFIG_KEEP_CONNECTION, true).
-
--define(HTML_STATUS_INTERNAL_SERVER_ERROR, 500).           %% @@@TODO: Am I using this? 
-
-%%  TO DO:  Handle failure and timeouts.
-
-%%  call_cgi calls the script `Scriptfilename' (full path).
-%%  If `Exefilename' is given, it is the executable to handle this, 
-%%  otherwise `Scriptfilame' is assumed to be executable itself.
-%%  
-%%  Corresponding to a URI of
-%%     `http://somehost/some/dir/script.cgi/path/info', 
-%%  `Pathinfo' should be set to `/path/info'.
-
-%%  These functions can be used from a `.yaws' file.
-%%  Note however, that they usually generate stream content.
-
-call_cgi(Arg, Scriptfilename) ->                                     
-    call_cgi(Arg, undefined, Scriptfilename, undefined, []).
-
-call_cgi(Arg, Exefilename, Scriptfilename) ->
-    call_cgi(Arg, Exefilename, Scriptfilename, undefined, []).
-
-call_cgi(Arg, Exefilename, Scriptfilename, Pathinfo) ->
-    call_cgi(Arg, Exefilename, Scriptfilename, Pathinfo, []).
-
-call_cgi(Arg, Exefilename, Scriptfilename, Pathinfo, ExtraEnv) ->
-    case Arg#arg.state of
-        {cgistate, Worker} ->
-            case Arg#arg.cont of
-                cgicont -> 
-                    handle_clidata(Arg, Worker);
-                undefined ->
-                    ?Debug("Error while reading clidata: ~p~n", 
-                           [Arg#arg.clidata]),
-                    %%  Error, what to do?
-                    exit(normal)
-            end;
-        _ ->
-            Worker = start_worker(Arg, Exefilename, Scriptfilename, 
-                                  Pathinfo, ExtraEnv, get(sc)),
-            handle_clidata(Arg, Worker)
-    end.
 
 handle_clidata(Arg, Worker) ->
     case Arg#arg.clidata of
@@ -106,33 +33,17 @@ handle_clidata(Arg, Worker) ->
             end_of_clidata(Arg, Worker)
     end.
 
+
 end_of_clidata(Arg, Worker) ->
     Worker ! {self(), end_of_clidata},
     get_from_worker(Arg, Worker).
+
 
 send_clidata(Worker, Data) ->
     Worker ! {self(), clidata, Data},
     receive
         {Worker, clidata_receipt} -> ok
     end.
-
-
-start_worker(Arg, Exefilename, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
-    ExeFN = case Exefilename of 
-                undefined -> exeof(Scriptfilename);
-                "" -> exeof(Scriptfilename);
-                FN -> FN
-            end,
-    PI = case Pathinfo of
-             undefined -> Arg#arg.pathinfo;
-             OK -> OK
-         end,
-%% @@    
-%%     Worker = proc_lib:spawn(?MODULE, cgi_worker, 
-%%                             [self(), Arg, ExeFN, Scriptfilename, PI, ExtraEnv, SC]),
-    Worker = proc_lib:spawn(?MODULE, fcgi_worker, 
-                            [self(), Arg, ExeFN, Scriptfilename, PI, ExtraEnv, SC]),
-    Worker.
 
 
 get_from_worker(Arg, Worker) ->
@@ -180,16 +91,17 @@ iscontent({streamcontent, _, _}) ->
 iscontent(_) ->
     false.
 
+
 isredirect({status, I}) when is_integer(I) , I >301, I < 304 ->
     true;
 isredirect(_) ->
     false.
 
+
 checkdef(undefined) ->
     "";
 checkdef(L) ->
     L.
-
 
 
 deep_drop_prefix([], L) ->
@@ -211,6 +123,7 @@ get_socket_peername(Socket) ->
     {ok, {IP, _Port}}=inet:peername(Socket),
     inet_parse:ntoa(IP).
 
+
 get_socket_sockname(Socket={sslsocket,_,_}) ->
     {ok, {IP, _Port}}=ssl:sockname(Socket),
     inet_parse:ntoa(IP);
@@ -219,7 +132,7 @@ get_socket_sockname(Socket) ->
     inet_parse:ntoa(IP).
 
 
-cgi_env(Arg, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
+build_env(Arg, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
     H = Arg#arg.headers,
     R = Arg#arg.req,
     case R#http_request.path of
@@ -385,22 +298,15 @@ cgi_env(Arg, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
 tohttp(X) ->
     "HTTP_"++lists:map(fun tohttp_c/1, yaws:to_list(X)).
 
+
 tohttp_c($-) ->
     $_;
+
 tohttp_c(C) when C >= $a , C =< $z ->
     C - $a + $A;
+
 tohttp_c(C) ->
     C.
-
-%% JMN - apparently redundant. host/1 was being used in cgi_env/5 when 
-%% Hostname had already been split out of Host. 
-%% %%  Get Host part from a host string that can contain host or host:port
-%% host(Host) ->
-%%    case string:tokens(Host, ":") of
-%%        [Hostname, _Port] -> Hostname;
-%%        [Hostname]       -> Hostname;
-%%        _Other           -> Host
-%%    end.
 
 
 make_cookie_val([]) ->
@@ -425,12 +331,14 @@ notslash($/) ->
 notslash(_) ->
     true.
 
+
 pathof(F) ->
     case lists:dropwhile(fun notslash/1, lists:reverse(F)) of
         "/" ->
             "/";
         [$/ | Tail] -> lists:reverse(Tail)
     end.
+
 
 exeof(F) ->
     [$\., $/|lists:reverse(lists:takewhile(fun notslash/1, lists:reverse(F)))].
@@ -455,7 +363,6 @@ do_header(_Arg, Line, _) ->
     {header, Line}.   
 
 
-
 get_resp(Worker) ->
     get_resp([], Worker).
 
@@ -478,37 +385,110 @@ get_resp(Hs, Worker) ->
     end.
 
 
+worker_fail(ParentPid, Failure) ->
+    ParentPid ! {failure, Failure},
+    exit(Failure).
+
+
+worker_fail_if(Condition, ParentPid, Failure) ->
+    if 
+        Condition ->
+            worker_fail(ParentPid, Failure);
+        true ->
+            ok
+    end.
+
+
+%%======================================================================================================================
+%% Code which is specific to CGI    
+%%======================================================================================================================
+
+%%  call_cgi calls the script `Scriptfilename' (full path).
+%%  If `Exefilename' is given, it is the executable to handle this, 
+%%  otherwise `Scriptfilame' is assumed to be executable itself.
+%%  
+%%  Corresponding to a URI of
+%%     `http://somehost/some/dir/script.cgi/path/info', 
+%%  `Pathinfo' should be set to `/path/info'.
+
+%%  These functions can be used from a `.yaws' file.
+%%  Note however, that they usually generate stream content.
+
+call_cgi(Arg, Scriptfilename) ->                                     
+    call_cgi(Arg, undefined, Scriptfilename, undefined, []).
+
+call_cgi(Arg, Exefilename, Scriptfilename) ->
+    call_cgi(Arg, Exefilename, Scriptfilename, undefined, []).
+
+call_cgi(Arg, Exefilename, Scriptfilename, Pathinfo) ->
+    call_cgi(Arg, Exefilename, Scriptfilename, Pathinfo, []).
+
+call_cgi(Arg, Exefilename, Scriptfilename, Pathinfo, ExtraEnv) ->
+    case Arg#arg.state of
+        {cgistate, Worker} ->
+            case Arg#arg.cont of
+                cgicont -> 
+                    handle_clidata(Arg, Worker);
+                undefined ->
+                    ?Debug("Error while reading clidata: ~p~n", 
+                           [Arg#arg.clidata]),
+                    %%  Error, what to do?
+                    exit(normal)
+            end;
+        _ ->
+            Worker = cgi_start_worker(Arg, Exefilename, Scriptfilename, 
+                                      Pathinfo, ExtraEnv, get(sc)),
+            handle_clidata(Arg, Worker)
+    end.
+
+
+cgi_start_worker(Arg, Exefilename, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
+    ExeFN = case Exefilename of 
+                undefined -> exeof(Scriptfilename);
+                "" -> exeof(Scriptfilename);
+                FN -> FN
+            end,
+    PI = case Pathinfo of
+             undefined -> Arg#arg.pathinfo;
+             OK -> OK
+         end,
+    Worker = proc_lib:spawn(?MODULE, cgi_worker, 
+                            [self(), Arg, ExeFN, Scriptfilename, PI, ExtraEnv, SC]),
+    Worker.
+
+
+
 cgi_worker(Parent, Arg, Exefilename, Scriptfilename, Pathinfo, ExtraEnv,SC) ->
-    Env = cgi_env(Arg, Scriptfilename, Pathinfo, ExtraEnv,SC),
+    Env = build_env(Arg, Scriptfilename, Pathinfo, ExtraEnv,SC),
     ?Debug("~p~n", [Env]),
     CGIPort = open_port({spawn, Exefilename},
                         [{env, Env}, 
                          {cd, pathof(Scriptfilename)},
                          exit_status,
                          binary]),
-    pass_through_clidata(Parent, CGIPort),
-    do_work(Parent, Arg, CGIPort).
+    cgi_pass_through_clidata(Parent, CGIPort),
+    cgi_do_work(Parent, Arg, CGIPort).
 
 
-
-pass_through_clidata(Parent, CGIPort) ->
+cgi_pass_through_clidata(Parent, CGIPort) ->
     receive
         {Parent, clidata, Clidata} ->
             ?Debug("Got clidata ~p~n", [binary_to_list(Clidata)]),
             Parent ! {self(), clidata_receipt},
             CGIPort ! {self(), {command, Clidata}},
-            pass_through_clidata(Parent, CGIPort);
+            cgi_pass_through_clidata(Parent, CGIPort);
         {Parent, end_of_clidata} ->
             ?Debug("End of clidata~n", []),
             ok
     end.
 
 
-do_work(Parent, Arg, Port) ->
-    header_loop(Parent, Arg, {start, Port}).
+cgi_do_work(Parent, Arg, Port) ->
+    cgi_header_loop(Parent, Arg, {start, Port}).
 
-header_loop(Parent, Arg, S) ->
-    Line = get_line(S),
+
+cgi_header_loop(Parent, Arg, S) ->
+    Line = cgi_get_line(S),
     ?Debug("Line = ~p~n", [Line]),
     case Line of
         {failure, F} ->
@@ -519,7 +499,7 @@ header_loop(Parent, Arg, S) ->
                     Parent ! {self(), partial_data, Data},
                     receive
                         {Parent, stream_data} ->
-                            data_loop(Arg#arg.pid, Port);
+                            cgi_data_loop(Arg#arg.pid, Port);
                         {Parent, no_data} ->
                             ok
                     end;
@@ -534,59 +514,59 @@ header_loop(Parent, Arg, S) ->
             end;
         {H, T} ->
             Parent ! {self(), header, H},
-            header_loop(Parent, Arg, T)
+            cgi_header_loop(Parent, Arg, T)
     end.
 
 
-data_loop(Pid, Port) ->
+cgi_data_loop(Pid, Port) ->
     receive
         {Port, {data,Data}} ->
             ?Debug("~p~n", [{data, binary_to_list(Data)}]),
             yaws_api:stream_chunk_deliver_blocking(Pid, Data),
-            data_loop(Pid, Port);
+            cgi_data_loop(Pid, Port);
         {Port, {exit_status, _Status}} ->
             ?Debug("~p~n", [{exit_status, _Status}]),            
             yaws_api:stream_chunk_end(Pid);
         _Other ->
             ?Debug("~p~n", [_Other]),
-            data_loop(Pid, Port)
+            cgi_data_loop(Pid, Port)
     end.
 
 
 
-get_line({start, Port}) ->
+cgi_get_line({start, Port}) ->
     receive
         {Port, {data,Data}} ->
-            get_line([], {middle, Data, Port});
+            cgi_get_line([], {middle, Data, Port});
         {Port, {exit_status, 0}} ->
             ?Debug("~p~n", [{exit_status, 0}]),
-            get_line([], {ending, <<>>, Port});
+            cgi_get_line([], {ending, <<>>, Port});
         {Port, {exit_status, Status}} when Status /=0 ->
             ?Debug("~p~n", [{exit_status, Status}]),
             {failure, {exit_status, Status}};
         _Other ->
             ?Debug("~p~n", [_Other]),            
-            get_line({start, Port})
+            cgi_get_line({start, Port})
     end;
-get_line(State) ->
-    get_line([], State).
+cgi_get_line(State) ->
+    cgi_get_line([], State).
 
 
-get_line(Acc, {S, <<10, Tail/binary>>, Port}) ->
+cgi_get_line(Acc, {S, <<10, Tail/binary>>, Port}) ->
     {lists:reverse(Acc), {S, Tail, Port}};
-get_line(Acc, {S, <<13, 10, Tail/binary>>, Port}) ->
+cgi_get_line(Acc, {S, <<13, 10, Tail/binary>>, Port}) ->
     {lists:reverse(Acc), {S, Tail, Port}};
-get_line(Acc, {middle, <<>>, Port}) ->
-    get_line(Acc, add_cgi_resp(<<>>, Port));
-get_line(Acc, {middle, <<13>>, Port}) ->          % We SHOULD test for CRLF.
-    get_line(Acc, add_cgi_resp(<<13>>, Port));    % Would be easier without.
-get_line(Acc, {ending, <<>>, Port}) ->
+cgi_get_line(Acc, {middle, <<>>, Port}) ->
+    cgi_get_line(Acc, cgi_add_resp(<<>>, Port));
+cgi_get_line(Acc, {middle, <<13>>, Port}) ->          % We SHOULD test for CRLF.
+    cgi_get_line(Acc, cgi_add_resp(<<13>>, Port));    % Would be easier without.
+cgi_get_line(Acc, {ending, <<>>, Port}) ->
     {lists:reverse(Acc), {ending, <<>>, Port}};
-get_line(Acc, {S, <<C, Tail/binary>>, Port}) ->
-    get_line([C|Acc], {S, Tail, Port}).
+cgi_get_line(Acc, {S, <<C, Tail/binary>>, Port}) ->
+    cgi_get_line([C|Acc], {S, Tail, Port}).
 
 
-add_cgi_resp(Bin, Port) ->
+cgi_add_resp(Bin, Port) ->
     receive
         {Port, {data,Data}} ->
             {middle, <<Bin/binary, Data/binary>>, Port};
@@ -595,121 +575,166 @@ add_cgi_resp(Bin, Port) ->
             {ending, Bin, Port};
         _Other ->
             ?Debug("~p~n", [_Other]),
-            add_cgi_resp(Bin, Port)
+            cgi_add_resp(Bin, Port)
     end.
 
 
+%%======================================================================================================================
+%% Code which is specific to FastCGI    
+%%======================================================================================================================
 
-% @TODO: Figure out which of these we need: Exefilename, Scriptfilename, Pathinfo
+-define(FCGI_VERSION_1, 1).
+
+-define(FCGI_TYPE_BEGIN_REQUEST, 1).
+-define(FCGI_TYPE_ABORT_REQUEST, 2).
+-define(FCGI_TYPE_END_REQUEST, 3).
+-define(FCGI_TYPE_PARAMS, 4).
+-define(FCGI_TYPE_STDIN, 5).
+-define(FCGI_TYPE_STDOUT, 6).
+-define(FCGI_TYPE_STDERR, 7).
+-define(FCGI_TYPE_DATA, 8).
+-define(FCGI_TYPE_GET_VALUES, 9).
+-define(FCGI_TYPE_GET_VALUES_RESULT, 10).
+-define(FCGI_TYPE_UNKNOWN_TYPE, 11).
+
+% The FCGI implementation does not support handling concurrent requests over a connection; it creates a separate 
+% connection for each request. Hence, all application records have the same request-id, namely 1.
 %
-fcgi_worker(Parent, Arg, ExeFileName, ScriptFileName, PathInfo, _ExtraEnv, _ServerConf) ->
-    ?Debug("[fcgi_worker] ExeFileName=~p ScriptFileName=~p PathInfo=~p~n", [ExeFileName, ScriptFileName, PathInfo]),
-    fgi_invoke_responder(Arg).
+-define(FCGI_REQUEST_ID_MANAGEMENT, 0).
+-define(FCGI_REQUEST_ID_APPLICATION, 1).
+
+-define(FCGI_DONT_KEEP_CONN, 0).
+-define(FCGI_KEEP_CONN, 1).
+
+-define(FCGI_ROLE_RESPONDER, 1).
+-define(FCGI_ROLE_AUTHORIZER, 2).
+-define(FCGI_ROLE_FILTER, 3).
+
+-define(FCGI_STATUS_REQUEST_COMPLETE, 0).
+-define(FCGI_STATUS_CANT_MPX_CONN, 1).
+-define(FCGI_STATUS_OVERLOADED, 2).
+-define(FCGI_STATUS_UNKNOWN_ROLE, 3).
+
+%% @@TODO: Make the following things configurable:
+%%
+-define(FCGI_CONFIG_APPLICATION_SERVER_NAME, "localhost").
+-define(FCGI_CONFIG_APPLICATION_SERVER_PORT, 9999).
+-define(FCGI_CONFIG_CONNECT_TIMEOUT_MSECS, 1000).
+-define(FCGI_CONFIG_READ_TIMEOUT_MSECS, 1000).             %% @@@TODO: distinction between first read and additional reads
+-define(FCGI_CONFIG_KEEP_CONNECTION, true).
+
+-define(HTML_STATUS_INTERNAL_SERVER_ERROR, 500).           %% @@@TODO: Am I using this? 
+
+%%  TO DO:  Handle failure and timeouts.
+
+%% @@ TODO: Add {ApplicationServerAddress, ApplicationServerPort} to signature after Arg
+call_fcgi_responder(Arg) ->
+    call_fcgi_responder(Arg, [], []).
+
+call_fcgi_responder(Arg, PathInfo) ->
+    call_fcgi_responder(Arg, PathInfo, []).
+
+call_fcgi_responder(Arg, PathInfo, ExtraEnv) ->
+    case Arg#arg.state of
+        {fcgi_responder_state, Worker} ->
+            case Arg#arg.cont of
+                fcgi_responder_cont -> 
+                    handle_clidata(Arg, Worker);
+                undefined ->
+                    ?Debug("Error while reading clidata: ~p~n", 
+                           [Arg#arg.clidata]),
+                    %%  Error, what to do?
+                    exit(normal)
+            end;
+        _ ->
+            Worker = fcgi_start_worker(Arg, PathInfo, ExtraEnv, get(sc)),
+            handle_clidata(Arg, Worker)
+    end.
 
 
-    
-fgi_invoke_responder(Arg) -> 
-    try
-        Socket = fcgi_connect_to_application_server(Arg),        %% @@@ TODO: support timeout
-        try                
-            ok = fcgi_send_begin_request(Socket, ?FCGI_ROLE_RESPONDER, ?FCGI_CONFIG_KEEP_CONNECTION),
-            ok = fcgi_send_params(Socket, fcgi_responder_cgi_params(Arg)),
-%% @@@TODO: user ExtraEnv            
-%%             case responder_additional_params(Arg) of
-%%                 {ok, Params} -> ok = send_params(Socket, Params);
-%%                 no_data -> ok
-%%             end,
-            ok = fcgi_send_params(Socket, []),
-            case fcgi_responder_cgi_stdin_data(Arg) of
-                {ok, StdinData} -> ok = fcgi_send_stdin(Socket, StdinData);
-                no_data -> ok
-            end,
-            ok = fcgi_send_stdin(Socket, <<>>),
-            {_AppStatus, _ProtStatus, StdOutData, _StdErrData} = fcgi_receive_reply(Socket),           % TODO: do something with appstatus and stderrdata
-            ClientSocket = Arg#arg.clisock,
-            ok = gen_tcp:send(ClientSocket, StdOutData),        %% TODO: this is a short term hack?
-            ok                                                  %% TODO: explain
-        catch
-            exception:Reason1 ->
-                gen_tcp:close(Socket),
-                [{status, ?HTML_STATUS_INTERNAL_SERVER_ERROR}, {ehtml, {p, [], io:format("~p", [Reason1])}}]
-        end,
-        gen_tcp:close(Socket),
-        ok                          
-    catch
-        exception:Reason2 ->
-            [{status, ?HTML_STATUS_INTERNAL_SERVER_ERROR}, {ehtml, {p, [], io:format("~p", [Reason2])}}]
-    end.          
+fcgi_start_worker(Arg, PathInfo, ExtraEnv, ServerConf) ->
+    NewPathInfo = case PathInfo of
+        undefined -> Arg#arg.pathinfo;
+        SomethingElse -> SomethingElse
+    end,
+    Worker = proc_lib:spawn(?MODULE, fcgi_worker, [self(), Arg, NewPathInfo, ExtraEnv, ServerConf]),
+    Worker.
 
 
+fcgi_worker(ParentPid, Arg, PathInfo, ExtraEnv, ServerConf) ->
+    ?Debug("[fcgi_worker] PathInfo=~p~n", [PathInfo]),
+    ScriptFileName = "",   %% @@ TODO: need to do something special?
+    Env = build_env(Arg, ScriptFileName, PathInfo, ExtraEnv, ServerConf),
+    Socket = fcgi_connect_to_application_server(ParentPid, Arg),
+    fcgi_send_begin_request(ParentPid, Socket, ?FCGI_ROLE_RESPONDER, ?FCGI_CONFIG_KEEP_CONNECTION),
+    fcgi_send_params(ParentPid, Socket, Env),
+    fcgi_send_params(ParentPid, Socket, []),
+    fcgi_pass_through_client_data(ParentPid, Socket),
+    fcgi_header_loop(ParentPid, Socket, Arg),
+    gen_tcp:close(Socket),
+    ok.
 
-fcgi_responder_cgi_params(Arg) ->
-    %% @@@TODO: replace with messages
-    no_data.
 
-
-
-fcgi_responder_cgi_stdin_data(_Arg) ->
-    %% @@@TODO: replace with messages
-    no_data.
-
+fcgi_pass_through_client_data(ParentPid, Socket) ->
+    receive
+        {ParentPid, clidata, ClientData} ->
+            ?Debug("FastCGI worker: received clidata ~p~n", [binary_to_list(ClientData)]),
+            ParentPid ! {self(), clidata_receipt},
+            fcgi_send_stdin(ParentPid, Socket, ClientData),
+            fcgi_pass_through_client_data(ParentPid, Socket);
+        {ParentPid, end_of_clidata} ->
+            ?Debug("FastCGI worker: received end_of_clidata~n", []),
+            fcgi_send_stdin(ParentPid, Socket, <<>>)
+    end.
 
 
 fcgi_choose_application_server(_Arg) ->
     {?FCGI_CONFIG_APPLICATION_SERVER_NAME, ?FCGI_CONFIG_APPLICATION_SERVER_PORT}.
 
 
-
-fcgi_connect_to_application_server(Arg) ->
+fcgi_connect_to_application_server(ParentPid, Arg) ->
     {Name, Port} = fcgi_choose_application_server(Arg),
     Options = [binary, {packet, 0}, {active, false}],
     case gen_tcp:connect(Name, Port, Options, ?FCGI_CONFIG_CONNECT_TIMEOUT_MSECS) of
-        {ok, Socket} ->
-            Socket;
         {error, Reason} ->
-            throw({could_not_connect_to_application_server, Name, Port, Reason})
+            worker_fail(ParentPid, {connect_to_application_server_failed, Reason});
+        {ok, Socket} ->
+            Socket
     end.
 
 
-
-fcgi_send_begin_request(Socket, Role, KeepConnection) ->
+fcgi_send_begin_request(ParentPid, Socket, Role, KeepConnection) ->
     Flags = case KeepConnection of
         true -> ?FCGI_KEEP_CONN;
         false -> ?FCGI_DONT_KEEP_CONN
     end,
-    fcgi_send_record(Socket, ?FCGI_TYPE_BEGIN_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<Role:16, Flags:8, 0:40>>).
+    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_BEGIN_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<Role:16, Flags:8, 0:40>>).
 
 
-
-fcgi_send_params(Socket, NameValueList) -> 
-    fcgi_send_record(Socket, ?FCGI_TYPE_PARAMS, ?FCGI_REQUEST_ID_APPLICATION, NameValueList).
-
+fcgi_send_params(ParentPid, Socket, NameValueList) -> 
+    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_PARAMS, ?FCGI_REQUEST_ID_APPLICATION, NameValueList).
 
 
-fcgi_send_stdin(Socket, Data) ->
-    fcgi_send_record(Socket, ?FCGI_TYPE_STDIN, ?FCGI_REQUEST_ID_APPLICATION, Data).
+fcgi_send_stdin(ParentPid, Socket, Data) ->
+    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_STDIN, ?FCGI_REQUEST_ID_APPLICATION, Data).
 
 
-
-fcgi_send_data(Socket, Data) ->
-    fcgi_send_record(Socket, ?FCGI_TYPE_DATA, ?FCGI_REQUEST_ID_APPLICATION, Data).
-
+fcgi_send_data(ParentPid, Socket, Data) ->
+    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_DATA, ?FCGI_REQUEST_ID_APPLICATION, Data).
 
 
-fcgi_send_abort_request(Socket) ->
-    fcgi_send_record(Socket, ?FCGI_TYPE_ABORT_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<>>).
+fcgi_send_abort_request(ParentPid, Socket) ->
+    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_ABORT_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<>>).
 
 
-
-fcgi_send_record(Socket, Type, RequestId, NameValueList) ->
+fcgi_send_record(ParentPid, Socket, Type, RequestId, NameValueList) ->
     EncodedRecord = fcgi_encode_record(Type, RequestId, NameValueList),
     case gen_tcp:send(Socket, EncodedRecord) of
         {error, Reason} ->
-            throw({error_sending_record, Reason});
+            worker_fail(ParentPid, {send_to_application_server_failed, Reason});
         ok ->
             ok
     end.
-
 
 
 fcgi_encode_record(Type, RequestId, NameValueList) 
@@ -738,18 +763,14 @@ fcgi_encode_record(Type, RequestId, ContentData)
       PaddingData/binary>>.
 
 
-
 fcgi_encode_name_value_list(_NameValueList = []) ->
     <<>>;
-
 fcgi_encode_name_value_list(_NameValueList = [{Name, Value} | Tail]) -> 
     <<(fcgi_encode_name_value(Name,Value))/binary, (fcgi_encode_name_value_list(Tail))/binary>>.
 
 
-
 fcgi_encode_name_value(Name, _Value = undefined) ->
     fcgi_encode_name_value(Name, "");
-
 fcgi_encode_name_value(Name, Value) when is_list(Name) and is_list(Value) ->
     NameSize = length(Name),
     NameSizeData = if
@@ -772,79 +793,149 @@ fcgi_encode_name_value(Name, Value) when is_list(Name) and is_list(Value) ->
       (list_to_binary(Value))/binary>>.
 
 
+fcgi_header_loop(ParentPid, Socket, Arg) ->
+    fcgi_header_loop(ParentPid, Socket, Arg, start).
 
-fcgi_receive_reply(Socket) ->
-    fcgi_receive_reply(Socket, [], []).
-
-fcgi_receive_reply(Socket, StdOutDataList, StdErrDataList) ->
-    {Type, ContentData} = fcgi_receive_record(Socket),
-    case Type of
-        ?FCGI_TYPE_END_REQUEST ->
-            <<AppStatus:32, ProtStatus:8, _Reserved:24>> = ContentData,
-            throw_if(ProtStatus < ?FCGI_STATUS_REQUEST_COMPLETE, {received_unknown_protocol_status, ProtStatus}),
-            throw_if(ProtStatus > ?FCGI_STATUS_UNKNOWN_ROLE, {received_unknown_protocol_status, ProtStatus}),
-            {AppStatus, ProtStatus, lists:reverse(StdOutDataList), lists:reverse(StdErrDataList)};
-        ?FCGI_TYPE_STDOUT ->
-            fcgi_receive_reply(Socket, [ContentData|StdOutDataList], StdErrDataList);
-        ?FCGI_TYPE_STDERR ->
-            fcgi_receive_reply(Socket, StdOutDataList, [ContentData|StdErrDataList]);
-        ?FCGI_TYPE_UNKNOWN_TYPE ->
-            <<Type:8, _Reserved:56>> = ContentData,
-            throw({application_reported_unknown_type, Type})
+fcgi_header_loop(ParentPid, Socket, Arg, GatherState) ->
+    Line = fcgi_get_line(ParentPid, Socket, GatherState),
+    ?Debug("[FastCGI] Line = ~p~n", [Line]),
+    case Line of
+        {failure, Failure} ->                           %% TODO: need this?
+            ParentPid ! {self(), failure, Failure};
+        {_EmptyLine = [], NewGatherState} ->
+            case NewGatherState of
+                {middle, Data} ->
+                    ParentPid ! {self(), partial_data, Data},
+                    receive
+                        {ParentPid, stream_data} ->
+                            fcgi_data_loop(ParentPid, Socket, Arg#arg.pid);
+                        {ParentPid, no_data} ->
+                            ok
+                    end;
+                {ending, Data} ->
+                    ParentPid ! {self(), all_data, Data},
+                    receive
+                        {ParentPid, stream_data} ->
+                            yaws_api:stream_chunk_end(Arg#arg.pid);
+                        {ParentPid, no_data} ->
+                            ok
+                    end
+            end;
+        {Header, NewGatherState} ->
+            ParentPid ! {self(), header, Header},
+            fcgi_header_loop(ParentPid, Socket, Arg, NewGatherState)
     end.
 
 
+fcgi_get_line(ParentPid, Socket, start) ->
+    case fcgi_get_output(ParentPid, Socket) of 
+        {data, Data} ->
+            fcgi_get_line(ParentPid, Socket, [], {middle, Data});
+        {exit_status, 0} ->
+            fcgi_get_line(ParentPid, Socket, [], {ending, <<>>});
+        {exit_status, Status} when Status /=0 ->
+            {failure, {exit_status, Status}}
+    end;
+fcgi_get_line(ParentPid, Socket, GatherState) ->
+    fcgi_get_line(ParentPid, Socket, [], GatherState).
 
-fcgi_receive_record(Socket) ->
-    case fcgi_receive_binary(Socket, 8, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
+fcgi_get_line(_ParentPid, _Socket, Acc, {State, <<10, Tail/binary>>}) ->
+    {lists:reverse(Acc), {State, Tail}};
+fcgi_get_line(_ParentPid, _Socket, Acc, {State, <<13, 10, Tail/binary>>}) ->
+    {lists:reverse(Acc), {State, Tail}};
+fcgi_get_line(ParentPid, Socket, Acc, {middle, <<>>}) ->
+    fcgi_get_line(ParentPid, Socket, Acc, fcgi_add_resp(ParentPid, Socket, <<>>));
+fcgi_get_line(ParentPid, Socket, Acc, {middle, <<13>>}) ->
+    fcgi_get_line(ParentPid, Socket, Acc, fcgi_add_resp(ParentPid, Socket, <<13>>));
+fcgi_get_line(_ParentPid, _Socket, Acc, {ending, <<>>}) ->
+    {lists:reverse(Acc), {ending, <<>>}};
+fcgi_get_line(ParentPid, Socket, Acc, {State, <<Char, Tail/binary>>}) ->
+    fcgi_get_line(ParentPid, Socket, [Char | Acc], {State, Tail}).
+
+
+fcgi_add_resp(ParentPid, Socket, OldData) ->
+    case fcgi_get_output(ParentPid, Socket) of 
+        {data, NewData} ->
+            {middle, <<OldData/binary, NewData/binary>>};
+        {exit_status, _Status} ->
+            {ending, OldData}
+    end.
+
+
+fcgi_data_loop(ParentPid, Socket, StreamToPid) ->
+    case fcgi_get_output(ParentPid, Socket) of 
+        {data, Data} ->
+            yaws_api:stream_chunk_deliver_blocking(StreamToPid, Data),
+            fcgi_data_loop(ParentPid, Socket, StreamToPid);
+        {exit_status, _Status} ->
+            yaws_api:stream_chunk_end(StreamToPid)
+    end.
+
+
+fcgi_get_output(ParentPid, Socket) ->
+    {Type, ContentData} = fcgi_receive_record(ParentPid, Socket),
+    case Type of
+        ?FCGI_TYPE_END_REQUEST ->
+            %% TODO: handle non-success prot status
+            <<AppStatus:32, ProtStatus:8, _Reserved:24>> = ContentData,
+            worker_fail_if(ParentPid, ProtStatus < ?FCGI_STATUS_REQUEST_COMPLETE, {received_unknown_protocol_status, ProtStatus}),
+            worker_fail_if(ProtStatus > ?FCGI_STATUS_UNKNOWN_ROLE, ParentPid, {received_unknown_protocol_status, ProtStatus}),
+            {exit_status, AppStatus};
+        ?FCGI_TYPE_STDOUT ->
+            {data, ContentData};
+        ?FCGI_TYPE_STDERR ->
+            %% @@TODO: send message for stderr
+            fcgi_get_output(ParentPid, Socket);
+        ?FCGI_TYPE_UNKNOWN_TYPE ->
+            <<UnknownType:8, _Reserved:56>> = ContentData,
+            worker_fail(ParentPid, {application_did_not_understand_record_type_we_sent, UnknownType});
+        OtherType ->
+            worker_fail(ParentPid, {received_unknown_record_type, OtherType})
+    end.
+
+
+fcgi_receive_record(ParentPid, Socket) ->
+    {ok, Header} = fcgi_receive_binary(ParentPid, Socket, 8, ?FCGI_CONFIG_READ_TIMEOUT_MSECS),
+    <<Version:8, Type:8, RequestId:16, ContentLength:16, PaddingLength:8, _Reserved:8>> = Header, 
+    worker_fail_if(Version /= 1, ParentPid, {received_unsupported_version, Version}),
+    case Type of
+        ?FCGI_TYPE_END_REQUEST ->
+            worker_fail_if(ParentPid, RequestId /= ?FCGI_REQUEST_ID_APPLICATION, {unexpected_request_id, RequestId}),
+            worker_fail_if(ParentPid, ContentLength /= 8, {incorrect_content_length_for_end_request, ContentLength}),
+            ok;
+        ?FCGI_TYPE_STDOUT ->
+            worker_fail_if(ParentPid, RequestId /= ?FCGI_REQUEST_ID_APPLICATION, {unexpected_request_id, RequestId}),
+            ok;
+        ?FCGI_TYPE_STDERR ->
+            worker_fail_if(ParentPid, RequestId /= ?FCGI_REQUEST_ID_APPLICATION, {unexpected_request_id, RequestId}),
+            ok;
+        ?FCGI_TYPE_UNKNOWN_TYPE ->
+            worker_fail_if(ParentPid, RequestId /= ?FCGI_REQUEST_ID_MANAGEMENT, {unexpected_request_id, RequestId}),
+            worker_fail_if(ParentPid, ContentLength /= 8, {incorrect_content_length_for_unknown_type, ContentLength}),
+            ok;
+        OtherType ->
+            throw({received_unexpected_type, OtherType})
+    end,
+    ?Debug("[FastCGI] Type=~p ContentLength=~p~n", [Type, ContentLength]),
+    case fcgi_receive_binary(ParentPid, Socket, ContentLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
         {error, Reason} ->
-            throw({unable_to_read_record_header, Reason});
-        {ok, <<Version:8, Type:8, RequestId:16, ContentLength:16, PaddingLength:8, _Reserved:8>>} ->
-            throw_if(Version /= 1, {received_unsupported_version, Version}),
-            case Type of
-                ?FCGI_TYPE_END_REQUEST ->
-                    throw_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, {unexpected_request_id, RequestId}),
-                    throw_if(ContentLength /= 8, {incorrect_content_length_for_end_request, ContentLength}),
-                    ok;
-                ?FCGI_TYPE_STDOUT ->
-                    throw_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, {unexpected_request_id, RequestId}),
-                    ok;
-                ?FCGI_TYPE_STDERR ->
-                    throw_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, {unexpected_request_id, RequestId}),
-                    ok;
-                ?FCGI_TYPE_UNKNOWN_TYPE ->
-                    throw_if(RequestId /= ?FCGI_REQUEST_ID_MANAGEMENT, {unexpected_request_id, RequestId}),
-                    throw_if(ContentLength /= 8, {incorrect_content_length_for_unknown_type, ContentLength}),
-                    ok;
-                OtherType ->
-                    throw({received_unexpected_type, OtherType})
-            end,
-            case fcgi_receive_binary(Socket, ContentLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
+            worker_fail(ParentPid, {unable_to_read_content_data, Reason});
+        {ok, ContentData} ->
+            case fcgi_receive_binary(ParentPid, Socket, PaddingLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
                 {error, Reason} ->
-                    throw({unable_to_read_content_data, Reason});
-                {ok, ContentData} ->
-                    case fcgi_receive_binary(Socket, PaddingLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
-                        {error, Reason} ->
-                            throw({unable_to_read_record_padding_data, Reason});
-                        {ok, _PaddingData} ->
-                            {Type, ContentData}                            
-                    end
+                    worker_fail(ParentPid, {unable_to_read_record_padding_data, Reason});
+                {ok, _PaddingData} ->
+                    {Type, ContentData}                            
             end
     end.
 
 
-fcgi_receive_binary(_Socket, Length, _Timeout) when Length == 0 ->
+fcgi_receive_binary(_ParentPid, _Socket, Length, _Timeout) when Length == 0 ->
     {ok, <<>>};
-
-fcgi_receive_binary(Socket, Length, Timeout) ->
-    gen_tcp:recv(Socket, Length, Timeout).
-
-
-
-throw_if(Condition, Exception) ->
-    if 
-        Condition ->
-            throw(Exception);
-        true ->
-            ok
+fcgi_receive_binary(ParentPid, Socket, Length, Timeout) ->
+    case gen_tcp:recv(Socket, Length, Timeout) of
+        {error, Reason} ->
+            worker_fail(ParentPid, {send_to_application_server_failed, Reason});
+        {ok, Data} ->
+            {ok, Data}
     end.
