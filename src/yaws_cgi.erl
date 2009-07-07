@@ -1,5 +1,6 @@
 -module(yaws_cgi).
 -author('carsten@codimi.de').
+-author('brunorijsman@hotmail.com').         %% Added support for FastCGI
 
 %% @@@ remove this
 -define(debug, true).
@@ -9,9 +10,9 @@
 -include("../include/yaws.hrl").
 
 -export([call_cgi/5, call_cgi/4, call_cgi/3, call_cgi/2]).
--export([call_fcgi_responder/3, call_fcgi_responder/2, call_fcgi_responder/1]).
+-export([call_fcgi_responder/2, call_fcgi_responder/1]).
 
--export([cgi_worker/7, fcgi_worker/5]).
+-export([cgi_worker/7, fcgi_worker/4]).
 
 %%======================================================================================================================
 %% Code which is shared between CGI and FastCGI    
@@ -399,9 +400,18 @@ worker_fail_if(Condition, ParentPid, Failure) ->
     end.
 
 
+get_opt(Key, List, Default) ->
+    case lists:keysearch(Key, 1, List) of
+        {value, {_Key, Val}} -> Val;
+        _ -> Default
+    end.
+
+
 %%======================================================================================================================
 %% Code which is specific to CGI    
 %%======================================================================================================================
+
+%%  TO DO:  Handle failure and timeouts.
 
 %%  call_cgi calls the script `Scriptfilename' (full path).
 %%  If `Exefilename' is given, it is the executable to handle this, 
@@ -552,14 +562,14 @@ cgi_get_line(State) ->
     cgi_get_line([], State).
 
 
-cgi_get_line(Acc, {S, <<10, Tail/binary>>, Port}) ->
+cgi_get_line(Acc, {S, <<?ASCII_NEW_LINE, Tail/binary>>, Port}) ->
     {lists:reverse(Acc), {S, Tail, Port}};
-cgi_get_line(Acc, {S, <<13, 10, Tail/binary>>, Port}) ->
+cgi_get_line(Acc, {S, <<?ASCII_CARRIAGE_RETURN, ?ASCII_NEW_LINE, Tail/binary>>, Port}) ->
     {lists:reverse(Acc), {S, Tail, Port}};
 cgi_get_line(Acc, {middle, <<>>, Port}) ->
     cgi_get_line(Acc, cgi_add_resp(<<>>, Port));
-cgi_get_line(Acc, {middle, <<13>>, Port}) ->          % We SHOULD test for CRLF.
-    cgi_get_line(Acc, cgi_add_resp(<<13>>, Port));    % Would be easier without.
+cgi_get_line(Acc, {middle, <<?ASCII_CARRIAGE_RETURN>>, Port}) ->          % We SHOULD test for CRLF.
+    cgi_get_line(Acc, cgi_add_resp(<<?ASCII_CARRIAGE_RETURN>>, Port));    % Would be easier without.
 cgi_get_line(Acc, {ending, <<>>, Port}) ->
     {lists:reverse(Acc), {ending, <<>>, Port}};
 cgi_get_line(Acc, {S, <<C, Tail/binary>>, Port}) ->
@@ -615,120 +625,222 @@ cgi_add_resp(Bin, Port) ->
 -define(FCGI_STATUS_OVERLOADED, 2).
 -define(FCGI_STATUS_UNKNOWN_ROLE, 3).
 
-%% @@TODO: Make the following things configurable:
+%% @@TODO: Make this a total timeout
 %%
--define(FCGI_CONFIG_APPLICATION_SERVER_NAME, "localhost").
--define(FCGI_CONFIG_APPLICATION_SERVER_PORT, 9999).
 -define(FCGI_CONFIG_CONNECT_TIMEOUT_MSECS, 1000).
--define(FCGI_CONFIG_READ_TIMEOUT_MSECS, 1000).             %% @@@TODO: distinction between first read and additional reads
--define(FCGI_CONFIG_KEEP_CONNECTION, true).
+-define(FCGI_CONFIG_READ_TIMEOUT_MSECS, 1000).
 
--define(HTML_STATUS_INTERNAL_SERVER_ERROR, 500).           %% @@@TODO: Am I using this? 
+% We currently always delegate close authority to the application. We might want to add a configuration option for this.
+%
+-define(FCGI_CONFIG_KEEP_CONNECTION, false).
 
-%%  TO DO:  Handle failure and timeouts.
+%% @@TODO: Make all of the following things configurable in yaws.conf
+%% @@TODO: implement timeout
+%% @@TODO: add flag for logging stderr output
+-record(fcgi_conf, {
+            app_server_host,            % The hostname or IP address of the application server
+            app_server_port,            % The TCP port number of the application server
+            path_info,                  % The path info
+            extra_env,                  % Any extra environment variables to be passed to the application server
+            request_timeout,            % Total amount of time (in milliseconds) allowed for a request to be completed
+            trace_protocol              % If true, log info messages for sent and received FastCGI messages
+        }).
 
-%% @@ TODO: Add {ApplicationServerAddress, ApplicationServerPort} to signature after Arg
 call_fcgi_responder(Arg) ->
-    call_fcgi_responder(Arg, [], []).
+    call_fcgi_responder(Arg, []).
 
-call_fcgi_responder(Arg, PathInfo) ->
-    call_fcgi_responder(Arg, PathInfo, []).
-
-call_fcgi_responder(Arg, PathInfo, ExtraEnv) ->
+call_fcgi_responder(Arg, Options) ->
     case Arg#arg.state of
-        {fcgi_responder_state, Worker} ->
+        {cgistate, Worker} ->
             case Arg#arg.cont of
-                fcgi_responder_cont -> 
-                    handle_clidata(Arg, Worker);
-                undefined ->
-                    ?Debug("Error while reading clidata: ~p~n", 
-                           [Arg#arg.clidata]),
-                    %%  Error, what to do?
-                    exit(normal)
+                cgicont -> 
+                    ?Debug("call_fcgi_responder: continuation~n", []),
+                    handle_clidata(Arg, Worker)
             end;
         _ ->
-            Worker = fcgi_start_worker(Arg, PathInfo, ExtraEnv, get(sc)),
+            ServerConf = get(sc),
+            AppServerHost = get_opt(app_server_host, Options, ServerConf#sconf.fcgi_app_server_host),
+            AppServerPort = get_opt(app_server_port, Options, ServerConf#sconf.fcgi_app_server_port),
+            PathInfo = get_opt(path_info, Options, Arg#arg.pathinfo),
+            ExtraEnv = get_opt(extra_env, Options, []),
+            RequestTimeout = get_opt(request_timeout, Options, 5000),
+            TraceProtocol = get_opt(trace_protocol, Options, ?sc_fcgi_trace_protocol(ServerConf)),
+            ?Debug("call_fcgi_responder:~n"
+                   "  AppServerHost = ~p~n"
+                   "  AppServerPort = ~p~n"
+                   "  PathInfo = ~p~n"
+                   "  ExtraEnv = ~p~n"
+                   "  RequestTimeout = ~p~n"
+                   "  TraceProtocol = ~p~n", 
+                   [AppServerHost, AppServerPort, PathInfo, ExtraEnv, RequestTimeout, TraceProtocol]),
+            FcgiConf = #fcgi_conf{
+                app_server_host = AppServerHost,
+                app_server_port = AppServerPort,
+                path_info = PathInfo,
+                extra_env = ExtraEnv,
+                request_timeout = RequestTimeout,
+                trace_protocol = TraceProtocol              
+            },
+            Worker = fcgi_start_worker(Arg, ServerConf, FcgiConf),
             handle_clidata(Arg, Worker)
     end.
 
 
-fcgi_start_worker(Arg, PathInfo, ExtraEnv, ServerConf) ->
-    NewPathInfo = case PathInfo of
-        undefined -> Arg#arg.pathinfo;
-        SomethingElse -> SomethingElse
-    end,
-    Worker = proc_lib:spawn(?MODULE, fcgi_worker, [self(), Arg, NewPathInfo, ExtraEnv, ServerConf]),
-    Worker.
+fcgi_start_worker(Arg, ServerConf, FcgiConf) ->
+    proc_lib:spawn(?MODULE, fcgi_worker, [self(), Arg, ServerConf, FcgiConf]).
 
 
-fcgi_worker(ParentPid, Arg, PathInfo, ExtraEnv, ServerConf) ->
-    ?Debug("[fcgi_worker] PathInfo=~p~n", [PathInfo]),
-    ScriptFileName = "",   %% @@ TODO: need to do something special?
+fcgi_worker(ParentPid, Arg, ServerConf, FcgiConf) ->
+    ScriptFileName = "",
+    PathInfo = FcgiConf#fcgi_conf.path_info,
+    ExtraEnv = FcgiConf#fcgi_conf.extra_env,
     Env = build_env(Arg, ScriptFileName, PathInfo, ExtraEnv, ServerConf),
-    Socket = fcgi_connect_to_application_server(ParentPid, Arg),
-    fcgi_send_begin_request(ParentPid, Socket, ?FCGI_ROLE_RESPONDER, ?FCGI_CONFIG_KEEP_CONNECTION),
-    fcgi_send_params(ParentPid, Socket, Env),
-    fcgi_send_params(ParentPid, Socket, []),
-    fcgi_pass_through_client_data(ParentPid, Socket),
-    fcgi_header_loop(ParentPid, Socket, Arg),
-    gen_tcp:close(Socket),
+    Trace = FcgiConf#fcgi_conf.trace_protocol,
+    Socket = fcgi_connect_to_application_server(ParentPid, Arg, ServerConf),
+    fcgi_send_begin_request(ParentPid, Socket, Trace, ?FCGI_ROLE_RESPONDER, ?FCGI_CONFIG_KEEP_CONNECTION),
+    fcgi_send_params(ParentPid, Socket, Trace, Env),
+    fcgi_send_params(ParentPid, Socket, Trace, []),
+    fcgi_pass_through_client_data(ParentPid, Socket, Trace),
+    fcgi_header_loop(ParentPid, Socket, Trace, Arg),
+    gen_tcp:close(Socket),     % If keep connection is false, application should close connection, but don't rely on it.
     ok.
 
 
-fcgi_pass_through_client_data(ParentPid, Socket) ->
+fcgi_pass_through_client_data(ParentPid, Socket, Trace) ->
     receive
         {ParentPid, clidata, ClientData} ->
-            ?Debug("FastCGI worker: received clidata ~p~n", [binary_to_list(ClientData)]),
             ParentPid ! {self(), clidata_receipt},
-            fcgi_send_stdin(ParentPid, Socket, ClientData),
-            fcgi_pass_through_client_data(ParentPid, Socket);
+            fcgi_send_stdin(ParentPid, Socket, Trace, ClientData),
+            fcgi_pass_through_client_data(ParentPid, Socket, Trace);
         {ParentPid, end_of_clidata} ->
-            ?Debug("FastCGI worker: received end_of_clidata~n", []),
-            fcgi_send_stdin(ParentPid, Socket, <<>>)
+            fcgi_send_stdin(ParentPid, Socket, Trace, <<>>)
     end.
 
 
-fcgi_choose_application_server(_Arg) ->
-    {?FCGI_CONFIG_APPLICATION_SERVER_NAME, ?FCGI_CONFIG_APPLICATION_SERVER_PORT}.
+fcgi_choose_application_server(ParentPid, _Arg, ServerConf) ->
+    Host = case ServerConf#sconf.fcgi_app_server_host of
+        undefined ->
+            worker_fail(ParentPid, fcgi_app_server_host_not_configured);
+        ValidHost ->
+            ValidHost
+    end,
+    Port = case ServerConf#sconf.fcgi_app_server_port of
+        undefined ->
+            worker_fail(ParentPid, fcgi_app_server_port_not_configured);
+        ValidPort ->
+            ValidPort
+    end,
+    {Host, Port}.
 
 
-fcgi_connect_to_application_server(ParentPid, Arg) ->
-    {Name, Port} = fcgi_choose_application_server(Arg),
+fcgi_connect_to_application_server(ParentPid, Arg, ServerConf) ->
+    {Host, Port} = fcgi_choose_application_server(ParentPid, Arg, ServerConf),
     Options = [binary, {packet, 0}, {active, false}],
-    case gen_tcp:connect(Name, Port, Options, ?FCGI_CONFIG_CONNECT_TIMEOUT_MSECS) of
-        {error, Reason} ->
-            worker_fail(ParentPid, {connect_to_application_server_failed, Reason});
+    case gen_tcp:connect(Host, Port, Options, ?FCGI_CONFIG_CONNECT_TIMEOUT_MSECS) of
+        {error, Reason2} ->
+            worker_fail(ParentPid, {connect_to_application_server_failed, Reason2});
         {ok, Socket} ->
             Socket
     end.
 
 
-fcgi_send_begin_request(ParentPid, Socket, Role, KeepConnection) ->
+fcgi_send_begin_request(ParentPid, Socket, Trace, Role, KeepConnection) ->
     Flags = case KeepConnection of
         true -> ?FCGI_KEEP_CONN;
         false -> ?FCGI_DONT_KEEP_CONN
     end,
-    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_BEGIN_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<Role:16, Flags:8, 0:40>>).
+    fcgi_send_record(ParentPid, Socket, Trace, ?FCGI_TYPE_BEGIN_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, 
+                     <<Role:16, Flags:8, 0:40>>).
 
 
-fcgi_send_params(ParentPid, Socket, NameValueList) -> 
-    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_PARAMS, ?FCGI_REQUEST_ID_APPLICATION, NameValueList).
+fcgi_send_params(ParentPid, Socket, Trace, NameValueList) -> 
+    fcgi_send_record(ParentPid, Socket, Trace, ?FCGI_TYPE_PARAMS, ?FCGI_REQUEST_ID_APPLICATION, NameValueList).
 
 
-fcgi_send_stdin(ParentPid, Socket, Data) ->
-    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_STDIN, ?FCGI_REQUEST_ID_APPLICATION, Data).
+fcgi_send_stdin(ParentPid, Socket, Trace, Data) ->
+    fcgi_send_record(ParentPid, Socket, Trace, ?FCGI_TYPE_STDIN, ?FCGI_REQUEST_ID_APPLICATION, Data).
 
 
-fcgi_send_data(ParentPid, Socket, Data) ->
-    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_DATA, ?FCGI_REQUEST_ID_APPLICATION, Data).
+%% TODO: Not used yet
+%% fcgi_send_data(ParentPid, Socket, Data) ->
+%%     fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_DATA, ?FCGI_REQUEST_ID_APPLICATION, Data).
 
 
-fcgi_send_abort_request(ParentPid, Socket) ->
-    fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_ABORT_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<>>).
+%% TODO: Not used yet
+%% fcgi_send_abort_request(ParentPid, Socket) ->
+%%     fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_ABORT_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<>>).
 
 
-fcgi_send_record(ParentPid, Socket, Type, RequestId, NameValueList) ->
-    EncodedRecord = fcgi_encode_record(Type, RequestId, NameValueList),
+fcgi_type_name(?FCGI_TYPE_BEGIN_REQUEST) -> "begin-request";
+fcgi_type_name(?FCGI_TYPE_ABORT_REQUEST) -> "abort-request";
+fcgi_type_name(?FCGI_TYPE_END_REQUEST) -> "end-request";
+fcgi_type_name(?FCGI_TYPE_PARAMS) -> "params";
+fcgi_type_name(?FCGI_TYPE_STDIN) -> "stdin";
+fcgi_type_name(?FCGI_TYPE_STDOUT) -> "stdout";
+fcgi_type_name(?FCGI_TYPE_STDERR) -> "stderr";
+fcgi_type_name(?FCGI_TYPE_DATA) -> "data";
+fcgi_type_name(?FCGI_TYPE_GET_VALUES) -> "get_values";
+fcgi_type_name(?FCGI_TYPE_GET_VALUES_RESULT) -> "get_values_result";
+fcgi_type_name(?FCGI_TYPE_UNKNOWN_TYPE) -> "unknown-type";
+fcgi_type_name(_) -> "?".
+
+fcgi_data_to_string(Data) ->
+    fcgi_data_to_string("", 0, "", "", Data).
+
+fcgi_data_to_string(LinesStr, Count, CharStr, HexStr, <<>>) ->
+    if
+        Count == 0 ->
+            LinesStr;
+        true ->
+            Padding = lists:duplicate(16 - Count, $ ),
+            LinesStr ++ "\n    " ++ CharStr ++ Padding ++ "  " ++ HexStr
+    end;
+fcgi_data_to_string(LinesStr, Count, CharStr, HexStr, <<Byte:8, MoreData/binary>>) ->
+    Char = if 
+        (Byte >= $!) and (Byte =< $~) ->
+            Byte;
+        true ->
+            $.
+    end,
+    Hex = io_lib:format("~2.16.0b ", [Byte]),
+    if
+        Count == 16 ->
+            fcgi_data_to_string(LinesStr ++ "\n    " ++ CharStr ++ "  " ++ HexStr, 1, [Char], Hex, MoreData);
+        true ->
+            fcgi_data_to_string(LinesStr, Count + 1, CharStr ++ [Char], HexStr ++ Hex, MoreData)
+    end.
+
+
+fcgi_trace_protocol(Trace, Action, Version, Type, RequestId, ContentLength, PaddingLength, Reserved, ContentData, 
+                    PaddingData) ->
+    if
+        Trace -> 
+            error_logger:info_msg(
+                "~s FastCGI record:~n"
+                "  version = ~p~n"
+                "  type = ~p (~s)~n"
+                "  request-id = ~p~n"
+                "  content-length = ~p~n"
+                "  padding-length = ~p~n"
+                "  reserved = ~p~n"
+                "  content-data = ~s~n"
+                "  padding-data = ~s~n",
+                [Action,
+                 Version, 
+                 Type, fcgi_type_name(Type), 
+                 RequestId, 
+                 ContentLength, 
+                 PaddingLength, 
+                 Reserved, 
+                 fcgi_data_to_string(ContentData), 
+                 fcgi_data_to_string(PaddingData)]);
+        true -> 
+            ok
+    end.
+    
+    
+fcgi_send_record(ParentPid, Socket, Trace, Type, RequestId, NameValueList) ->
+    EncodedRecord = fcgi_encode_record(Trace, Type, RequestId, NameValueList),
     case gen_tcp:send(Socket, EncodedRecord) of
         {error, Reason} ->
             worker_fail(ParentPid, {send_to_application_server_failed, Reason});
@@ -737,11 +849,11 @@ fcgi_send_record(ParentPid, Socket, Type, RequestId, NameValueList) ->
     end.
 
 
-fcgi_encode_record(Type, RequestId, NameValueList) 
+fcgi_encode_record(Trace, Type, RequestId, NameValueList) 
   when is_list(NameValueList) ->
-    fcgi_encode_record(Type, RequestId, fcgi_encode_name_value_list(NameValueList));
+    fcgi_encode_record(Trace, Type, RequestId, fcgi_encode_name_value_list(NameValueList));
     
-fcgi_encode_record(Type, RequestId, ContentData) 
+fcgi_encode_record(Trace, Type, RequestId, ContentData) 
   when is_binary(ContentData) ->
     Version = 1,
     ContentLength = size(ContentData),
@@ -753,12 +865,14 @@ fcgi_encode_record(Type, RequestId, ContentData)
     end,
     PaddingData = <<0:(PaddingLength * 8)>>,
     Reserved = 0,
+    fcgi_trace_protocol(Trace, "Send", Version, Type, RequestId, ContentLength, PaddingLength, Reserved, ContentData, 
+                        PaddingData),
     <<Version:8,
       Type:8,
       RequestId:16,
       ContentLength:16,
       PaddingLength:8,
-      Reserved:8,                                           %% TODO: The spec is not clear where this goes
+      Reserved:8,
       ContentData/binary,
       PaddingData/binary>>.
 
@@ -793,12 +907,11 @@ fcgi_encode_name_value(Name, Value) when is_list(Name) and is_list(Value) ->
       (list_to_binary(Value))/binary>>.
 
 
-fcgi_header_loop(ParentPid, Socket, Arg) ->
-    fcgi_header_loop(ParentPid, Socket, Arg, start).
+fcgi_header_loop(ParentPid, Socket, Trace, Arg) ->
+    fcgi_header_loop(ParentPid, Socket, Trace, Arg, start).
 
-fcgi_header_loop(ParentPid, Socket, Arg, GatherState) ->
-    Line = fcgi_get_line(ParentPid, Socket, GatherState),
-    ?Debug("[FastCGI] Line = ~p~n", [Line]),
+fcgi_header_loop(ParentPid, Socket, Trace, Arg, GatherState) ->
+    Line = fcgi_get_line(ParentPid, Socket, Trace, GatherState),
     case Line of
         {failure, Failure} ->                           %% TODO: need this?
             ParentPid ! {self(), failure, Failure};
@@ -808,7 +921,7 @@ fcgi_header_loop(ParentPid, Socket, Arg, GatherState) ->
                     ParentPid ! {self(), partial_data, Data},
                     receive
                         {ParentPid, stream_data} ->
-                            fcgi_data_loop(ParentPid, Socket, Arg#arg.pid);
+                            fcgi_data_loop(ParentPid, Socket, Trace, Arg#arg.pid);
                         {ParentPid, no_data} ->
                             ok
                     end;
@@ -823,38 +936,38 @@ fcgi_header_loop(ParentPid, Socket, Arg, GatherState) ->
             end;
         {Header, NewGatherState} ->
             ParentPid ! {self(), header, Header},
-            fcgi_header_loop(ParentPid, Socket, Arg, NewGatherState)
+            fcgi_header_loop(ParentPid, Socket, Trace, Arg, NewGatherState)
     end.
 
 
-fcgi_get_line(ParentPid, Socket, start) ->
-    case fcgi_get_output(ParentPid, Socket) of 
+fcgi_get_line(ParentPid, Socket, Trace, start) ->
+    case fcgi_get_output(ParentPid, Socket, Trace) of 
         {data, Data} ->
-            fcgi_get_line(ParentPid, Socket, [], {middle, Data});
+            fcgi_get_line(ParentPid, Socket, Trace, [], {middle, Data});
         {exit_status, 0} ->
-            fcgi_get_line(ParentPid, Socket, [], {ending, <<>>});
+            fcgi_get_line(ParentPid, Socket, Trace, [], {ending, <<>>});
         {exit_status, Status} when Status /=0 ->
             {failure, {exit_status, Status}}
     end;
-fcgi_get_line(ParentPid, Socket, GatherState) ->
-    fcgi_get_line(ParentPid, Socket, [], GatherState).
+fcgi_get_line(ParentPid, Socket, Trace, GatherState) ->
+    fcgi_get_line(ParentPid, Socket, Trace, [], GatherState).
 
-fcgi_get_line(_ParentPid, _Socket, Acc, {State, <<10, Tail/binary>>}) ->
+fcgi_get_line(_ParentPid, _Socket, _Trace, Acc, {State, <<?ASCII_NEW_LINE, Tail/binary>>}) ->
     {lists:reverse(Acc), {State, Tail}};
-fcgi_get_line(_ParentPid, _Socket, Acc, {State, <<13, 10, Tail/binary>>}) ->
+fcgi_get_line(_ParentPid, _Socket, _Trace, Acc, {State, <<?ASCII_CARRIAGE_RETURN, ?ASCII_NEW_LINE, Tail/binary>>}) ->
     {lists:reverse(Acc), {State, Tail}};
-fcgi_get_line(ParentPid, Socket, Acc, {middle, <<>>}) ->
-    fcgi_get_line(ParentPid, Socket, Acc, fcgi_add_resp(ParentPid, Socket, <<>>));
-fcgi_get_line(ParentPid, Socket, Acc, {middle, <<13>>}) ->
-    fcgi_get_line(ParentPid, Socket, Acc, fcgi_add_resp(ParentPid, Socket, <<13>>));
-fcgi_get_line(_ParentPid, _Socket, Acc, {ending, <<>>}) ->
+fcgi_get_line(ParentPid, Socket, Trace, Acc, {middle, <<>>}) ->
+    fcgi_get_line(ParentPid, Socket, Trace, Acc, fcgi_add_resp(ParentPid, Socket, Trace, <<>>));
+fcgi_get_line(ParentPid, Socket, Trace, Acc, {middle, <<?ASCII_CARRIAGE_RETURN>>}) ->
+    fcgi_get_line(ParentPid, Socket, Trace, Acc, fcgi_add_resp(ParentPid, Socket, Trace, <<?ASCII_CARRIAGE_RETURN>>));
+fcgi_get_line(_ParentPid, _Socket, _Trace, Acc, {ending, <<>>}) ->
     {lists:reverse(Acc), {ending, <<>>}};
-fcgi_get_line(ParentPid, Socket, Acc, {State, <<Char, Tail/binary>>}) ->
-    fcgi_get_line(ParentPid, Socket, [Char | Acc], {State, Tail}).
+fcgi_get_line(ParentPid, Socket, Trace, Acc, {State, <<Char, Tail/binary>>}) ->
+    fcgi_get_line(ParentPid, Socket, Trace, [Char | Acc], {State, Tail}).
 
 
-fcgi_add_resp(ParentPid, Socket, OldData) ->
-    case fcgi_get_output(ParentPid, Socket) of 
+fcgi_add_resp(ParentPid, Socket, Trace, OldData) ->
+    case fcgi_get_output(ParentPid, Socket, Trace) of 
         {data, NewData} ->
             {middle, <<OldData/binary, NewData/binary>>};
         {exit_status, _Status} ->
@@ -862,30 +975,32 @@ fcgi_add_resp(ParentPid, Socket, OldData) ->
     end.
 
 
-fcgi_data_loop(ParentPid, Socket, StreamToPid) ->
-    case fcgi_get_output(ParentPid, Socket) of 
+fcgi_data_loop(ParentPid, Socket, Trace, StreamToPid) ->
+    case fcgi_get_output(ParentPid, Socket, Trace) of 
         {data, Data} ->
             yaws_api:stream_chunk_deliver_blocking(StreamToPid, Data),
-            fcgi_data_loop(ParentPid, Socket, StreamToPid);
+            fcgi_data_loop(ParentPid, Socket, Trace, StreamToPid);
         {exit_status, _Status} ->
             yaws_api:stream_chunk_end(StreamToPid)
     end.
 
 
-fcgi_get_output(ParentPid, Socket) ->
-    {Type, ContentData} = fcgi_receive_record(ParentPid, Socket),
+fcgi_get_output(ParentPid, Socket, Trace) ->
+    {Type, ContentData} = fcgi_receive_record(ParentPid, Socket, Trace),
     case Type of
         ?FCGI_TYPE_END_REQUEST ->
-            %% TODO: handle non-success prot status
+            %% @@TODO: handle non-success prot status
             <<AppStatus:32, ProtStatus:8, _Reserved:24>> = ContentData,
-            worker_fail_if(ParentPid, ProtStatus < ?FCGI_STATUS_REQUEST_COMPLETE, {received_unknown_protocol_status, ProtStatus}),
-            worker_fail_if(ProtStatus > ?FCGI_STATUS_UNKNOWN_ROLE, ParentPid, {received_unknown_protocol_status, ProtStatus}),
+            worker_fail_if(ParentPid, ProtStatus < ?FCGI_STATUS_REQUEST_COMPLETE, 
+                           {received_unknown_protocol_status, ProtStatus}),
+            worker_fail_if(ProtStatus > ?FCGI_STATUS_UNKNOWN_ROLE, ParentPid, 
+                           {received_unknown_protocol_status, ProtStatus}),
             {exit_status, AppStatus};
         ?FCGI_TYPE_STDOUT ->
             {data, ContentData};
         ?FCGI_TYPE_STDERR ->
             %% @@TODO: send message for stderr
-            fcgi_get_output(ParentPid, Socket);
+            fcgi_get_output(ParentPid, Socket, Trace);
         ?FCGI_TYPE_UNKNOWN_TYPE ->
             <<UnknownType:8, _Reserved:56>> = ContentData,
             worker_fail(ParentPid, {application_did_not_understand_record_type_we_sent, UnknownType});
@@ -894,9 +1009,9 @@ fcgi_get_output(ParentPid, Socket) ->
     end.
 
 
-fcgi_receive_record(ParentPid, Socket) ->
+fcgi_receive_record(ParentPid, Socket, Trace) ->
     {ok, Header} = fcgi_receive_binary(ParentPid, Socket, 8, ?FCGI_CONFIG_READ_TIMEOUT_MSECS),
-    <<Version:8, Type:8, RequestId:16, ContentLength:16, PaddingLength:8, _Reserved:8>> = Header, 
+    <<Version:8, Type:8, RequestId:16, ContentLength:16, PaddingLength:8, Reserved:8>> = Header, 
     worker_fail_if(Version /= 1, ParentPid, {received_unsupported_version, Version}),
     case Type of
         ?FCGI_TYPE_END_REQUEST ->
@@ -916,7 +1031,6 @@ fcgi_receive_record(ParentPid, Socket) ->
         OtherType ->
             throw({received_unexpected_type, OtherType})
     end,
-    ?Debug("[FastCGI] Type=~p ContentLength=~p~n", [Type, ContentLength]),
     case fcgi_receive_binary(ParentPid, Socket, ContentLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
         {error, Reason} ->
             worker_fail(ParentPid, {unable_to_read_content_data, Reason});
@@ -924,7 +1038,9 @@ fcgi_receive_record(ParentPid, Socket) ->
             case fcgi_receive_binary(ParentPid, Socket, PaddingLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
                 {error, Reason} ->
                     worker_fail(ParentPid, {unable_to_read_record_padding_data, Reason});
-                {ok, _PaddingData} ->
+                {ok, PaddingData} ->
+                    fcgi_trace_protocol(Trace, "Receive", Version, Type, RequestId, ContentLength, PaddingLength, 
+                                        Reserved, ContentData, PaddingData),
                     {Type, ContentData}                            
             end
     end.

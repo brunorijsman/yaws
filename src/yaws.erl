@@ -277,7 +277,11 @@ setup_sconf(DocRoot, D, SL) ->
            revproxy = lkup(revproxy, SL, 
                            D#sconf.revproxy),
            soptions = lkup(soptions, SL,
-                           D#sconf.soptions)}.
+                           D#sconf.soptions),
+           fcgi_app_server_host = lkup(fcgi_app_server_host, SL, 
+                                       D#sconf.fcgi_app_server_host),
+           fcgi_app_server_port = lkup(fcgi_app_server_port, SL, 
+                                       D#sconf.fcgi_app_server_port)}.
 
 set_sc_flags([{access_log, Bool}|T], Flags) ->
     set_sc_flags(T, flag(Flags, ?SC_ACCESS_LOG, Bool));
@@ -293,6 +297,8 @@ set_sc_flags([{dir_all_zip, Bool}|T], Flags) ->
     set_sc_flags(T, flag(Flags, ?SC_DIR_ALL_ZIP, Bool));
 set_sc_flags([{dav, Bool}|T], Flags) ->
     set_sc_flags(T, flag(Flags, ?SC_DAV, Bool));
+set_sc_flags([{fcgi_trace_protocol, Bool}|T], Flags) ->
+    set_sc_flags(T, flag(Flags, ?SC_FCGI_TRACE_PROTOCOL, Bool));
 set_sc_flags([_|T], Flags) ->
     set_sc_flags(T, Flags);
 set_sc_flags([], Flags) ->
