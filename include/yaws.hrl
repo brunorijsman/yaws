@@ -111,6 +111,7 @@
 -define(SC_DIR_ALL_ZIP,         64).
 -define(SC_DAV,                 128).
 -define(SC_FCGI_TRACE_PROTOCOL, 512).
+-define(SC_FCGI_LOG_APP_STDERR, 1024).
 
 -define(SC_DEF, ?SC_ACCESS_LOG bor ?SC_ADD_PORT).
 
@@ -130,6 +131,8 @@
         (((SC)#sconf.flags band ?SC_DAV) /= 0)).
 -define(sc_fcgi_trace_protocol(SC),
         (((SC)#sconf.flags band ?SC_FCGI_TRACE_PROTOCOL) /= 0)).
+-define(sc_fcgi_log_app_stderr(SC),
+        (((SC)#sconf.flags band ?SC_FCGI_LOG_APP_STDERR) /= 0)).
 
 
 -define(sc_set_access_log(SC, Bool), 
@@ -150,6 +153,8 @@
         SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_DAV, Bool)}).
 -define(sc_set_fcgi_trace_protocol(SC, Bool), 
         SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_FCGI_TRACE_PROTOCOL, Bool)}).
+-define(sc_set_fcgi_log_app_stderr(SC, Bool), 
+        SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_FCGI_LOG_APP_STDERR, Bool)}).
 
 
 
