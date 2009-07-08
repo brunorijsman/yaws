@@ -9,10 +9,18 @@
 -include("yaws_debug.hrl").
 -include("../include/yaws.hrl").
 
+% Returns Out (i.e. same return values as out/1).
+%
 -export([call_cgi/5, call_cgi/4, call_cgi/3, call_cgi/2]).
 -export([call_fcgi_responder/2, call_fcgi_responder/1]).
 
--export([cgi_worker/7, fcgi_worker/4]).
+% Returns {allowed, Variables} or {denied, Out}.
+%
+-export([call_fcgi_authorizer/2, call_fcgi_authorizer/1]).
+
+% TODO: Implement FastCGI filter role.
+
+-export([cgi_worker/7, fcgi_worker/5]).
 
 %%======================================================================================================================
 %% Code which is shared between CGI and FastCGI    
@@ -552,7 +560,6 @@ cgi_get_line({start, Port}) ->
 cgi_get_line(State) ->
     cgi_get_line([], State).
 
-
 cgi_get_line(Acc, {S, <<?ASCII_NEW_LINE, Tail/binary>>, Port}) ->
     {lists:reverse(Acc), {S, Tail, Port}};
 cgi_get_line(Acc, {S, <<?ASCII_CARRIAGE_RETURN, ?ASCII_NEW_LINE, Tail/binary>>, Port}) ->
@@ -624,6 +631,11 @@ fcgi_type_name(_) -> "?".
 -define(FCGI_ROLE_AUTHORIZER, 2).
 -define(FCGI_ROLE_FILTER, 3).
 
+fcgi_role_name(?FCGI_ROLE_RESPONDER) -> "responder";
+fcgi_role_name(?FCGI_ROLE_AUTHORIZER) -> "authorizer";
+fcgi_role_name(?FCGI_ROLE_FILTER) -> "filter";
+fcgi_role_name(_) -> "?".
+
 -define(FCGI_STATUS_REQUEST_COMPLETE, 0).
 -define(FCGI_STATUS_CANT_MPX_CONN, 1).
 -define(FCGI_STATUS_OVERLOADED, 2).
@@ -653,30 +665,52 @@ fcgi_status_name(_) -> "?".
             keep_connection,            % Delegate close authority to the application?
             trace_protocol,             % If true, log info messages for sent and received FastCGI messages
             log_app_error,              % If true, log error messages for application errors (stderr and non-zero exit)
-            role,                       % The role of the worker (responder, authenticator, filter)
+            role,                       % The role of the worker (responder, authorizer, filter)
             parent_pid,                 % The PID of the parent process = the Yaws worker process
             app_server_socket,          % The TCP socket to the FastCGI application server
             stream_to_socket            % The TCP socket to the web browser (stream chunked delivery to this socket) 
         }).
 
+
 call_fcgi_responder(Arg) ->
     call_fcgi_responder(Arg, []).
 
 call_fcgi_responder(Arg, Options) ->
+    call_fcgi(?FCGI_ROLE_RESPONDER, Arg, Options).
+
+
+call_fcgi_authorizer(Arg) ->
+    call_fcgi_authorizer(Arg, []).
+
+call_fcgi_authorizer(Arg, Options) ->
+    Out = call_fcgi(?FCGI_ROLE_AUTHORIZER, Arg, Options),
+    case fcgi_is_access_allowed(Out) of
+        true ->
+            Variables = fcgi_extract_variables(Out),
+            {allowed, Variables};
+        false ->
+            {denied, Out}
+    end.
+         
+
+call_fcgi(Role, Arg, Options) ->
     case Arg#arg.state of
         {cgistate, WorkerPid} ->
             case Arg#arg.cont of
                 cgicont -> 
-                    ?Debug("Call FastCGI responder: continuation~n", []),
+                    ?Debug("Call FastCGI: continuation~n", []),
                     handle_clidata(Arg, WorkerPid)
             end;
         _ ->
-            ?Debug("Call FastCGI responder:~n"
-                   "  Arg = ~p~n"
-                   "  Options = ~p~n", 
-                   [Arg, Options]),
+            ?Debug("Call FastCGI:~n"
+                   "  Role = ~p (~s)~n"
+                   "  Options = ~p~n" 
+                   "  Arg = ~p~n",
+                   [Role, fcgi_role_name(Role),
+                    Options, 
+                    Arg]),
             ServerConf = get(sc),
-            WorkerPid = fcgi_start_worker(Arg, ServerConf, Options),
+            WorkerPid = fcgi_start_worker(Role, Arg, ServerConf, Options),
             handle_clidata(Arg, WorkerPid)
     end.
 
@@ -697,11 +731,11 @@ fcgi_worker_fail_if(Condition, WorkerState, Reason) ->
     end.
 
 
-fcgi_start_worker(Arg, ServerConf, Options) ->
-    proc_lib:spawn(?MODULE, fcgi_worker, [self(), Arg, ServerConf, Options]).
+fcgi_start_worker(Role, Arg, ServerConf, Options) ->
+    proc_lib:spawn(?MODULE, fcgi_worker, [self(), Role, Arg, ServerConf, Options]).
 
 
-fcgi_worker(ParentPid, Arg, ServerConf, Options) ->
+fcgi_worker(ParentPid, Role, Arg, ServerConf, Options) ->
     AppServerHost = get_opt(app_server_host, Options, ServerConf#sconf.fcgi_app_server_host),
     AppServerPort = get_opt(app_server_port, Options, ServerConf#sconf.fcgi_app_server_port),
     PreliminaryWorkerState = #fcgi_worker_state{parent_pid = ParentPid},
@@ -715,13 +749,20 @@ fcgi_worker(ParentPid, Arg, ServerConf, Options) ->
     LogAppError = get_opt(trace_protocol, Options, ?sc_fcgi_log_app_error(ServerConf)),
     AppServerSocket = fcgi_connect_to_application_server(PreliminaryWorkerState, AppServerHost, AppServerPort),
     ?Debug("Start FastCGI worker:~n"
+           "  Role = ~p (~s)~n"
            "  AppServerHost = ~p~n"
            "  AppServerPort = ~p~n"
            "  PathInfo = ~p~n"
            "  ExtraEnv = ~p~n"
            "  TraceProtocol = ~p~n" 
            "  LogAppStderr = ~p~n", 
-           [AppServerHost, AppServerPort, PathInfo, ExtraEnv, TraceProtocol, LogAppError]),
+           [Role, fcgi_role_name(Role),
+            AppServerHost, 
+            AppServerPort,
+            PathInfo, 
+            ExtraEnv, 
+            TraceProtocol, 
+            LogAppError]),
     WorkerState = #fcgi_worker_state{
                 app_server_host = AppServerHost,
                 app_server_port = AppServerPort,
@@ -730,7 +771,7 @@ fcgi_worker(ParentPid, Arg, ServerConf, Options) ->
                 keep_connection = false,             % Currently hard-coded; make configurable in the future?
                 trace_protocol = TraceProtocol,              
                 log_app_error = LogAppError,
-                role = ?FCGI_ROLE_RESPONDER,
+                role = Role,
                 parent_pid = ParentPid,      
                 app_server_socket = AppServerSocket       
             },
@@ -783,12 +824,14 @@ fcgi_send_stdin(WorkerState, Data) ->
     fcgi_send_record(WorkerState, ?FCGI_TYPE_STDIN, ?FCGI_REQUEST_ID_APPLICATION, Data).
 
 
-%% TODO: @@@ Not used yet
+%% Not needed yet
+%%
 %% fcgi_send_data(ParentPid, Socket, Data) ->
 %%     fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_DATA, ?FCGI_REQUEST_ID_APPLICATION, Data).
 
 
-%% TODO: @@@ Not used yet
+%% Not needed yet
+%%
 %% fcgi_send_abort_request(ParentPid, Socket) ->
 %%     fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_ABORT_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<>>).
 
@@ -1092,3 +1135,37 @@ fcgi_receive_binary(WorkerState, Length, Timeout) ->
         {ok, Data} ->
             {ok, Data}
     end.
+
+
+% Access is allowed if, and only if, the resonse from the authorizer running on the application server contains 
+% a 200 OK status. Any other status or absence of a status means access is denied.
+%
+fcgi_is_access_allowed([Head | Tail]) ->
+    fcgi_is_access_allowed(Head) orelse fcgi_is_access_allowed(Tail);
+fcgi_is_access_allowed({status, 200}) ->
+    true;
+fcgi_is_access_allowed(_AnythingElse) ->
+    false.
+
+
+% Look for headers of the form "Variable-VAR_NAME: var value"
+%
+fcgi_extract_variables([Head | Tail]) ->
+    fcgi_extract_variables(Head) ++ fcgi_extract_variables(Tail);
+fcgi_extract_variables({head, "Variable-" ++ Rest}) ->
+    [fcgi_split_header(Rest)];
+fcgi_extract_variables(_AnythingElse) ->
+    [].
+
+
+fcgi_split_header(Header) ->
+    fcgi_split_header(name, [], [], Header).
+
+fcgi_split_header(_, NameAcc, ValueAcc, "") ->
+    {string:strip(lists:reverse(NameAcc)), string:strip(lists:reverse(ValueAcc))};
+fcgi_split_header(name, NameAcc, ValueAcc, [$: | MoreStr]) ->
+    fcgi_split_header(value, NameAcc, ValueAcc, MoreStr);
+fcgi_split_header(name, NameAcc, ValueAcc, [Char | MoreStr]) ->
+    fcgi_split_header(name, [Char | NameAcc], ValueAcc, MoreStr);
+fcgi_split_header(value, NameAcc, ValueAcc, [Char | MoreStr]) ->
+    fcgi_split_header(value, NameAcc, [Char | ValueAcc], MoreStr).
