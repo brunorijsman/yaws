@@ -48,25 +48,29 @@ send_clidata(WorkerPid, Data) ->
 
 
 get_from_worker(Arg, WorkerPid) ->
-    {Headers, Data} = get_resp(WorkerPid),
-    AllResps = lists:map(fun(X)->do_header(Arg, X, Data) end, Headers),
-    {ContentResps, Others} = filter2(fun iscontent/1, AllResps),
-    {RedirResps, OtherResps} = filter2(fun isredirect/1, Others), 
-    case RedirResps of
-        [R|_] ->
-            WorkerPid ! {self(), no_data},
-            OtherResps ++ [R];
-        [] ->
-            case ContentResps of
-                [C={streamcontent, _, _}|_] ->
-                    WorkerPid ! {self(), stream_data},
-                    OtherResps++[C];
-                [C={content, _, _}|_] ->
+    case get_resp(WorkerPid) of
+        {failure, Reason} ->
+            [{status, 500}, {html, io_lib:format("CGI failure: ~p", [Reason])}];
+        {Headers, Data} ->
+            AllResps = lists:map(fun(X)->do_header(Arg, X, Data) end, Headers),
+            {ContentResps, Others} = filter2(fun iscontent/1, AllResps),
+            {RedirResps, OtherResps} = filter2(fun isredirect/1, Others), 
+            case RedirResps of
+                [R|_] ->
                     WorkerPid ! {self(), no_data},
-                    OtherResps++[C];
+                    OtherResps ++ [R];
                 [] ->
-                    WorkerPid ! {self(), no_data},
-                    OtherResps
+                    case ContentResps of
+                        [C={streamcontent, _, _}|_] ->
+                            WorkerPid ! {self(), stream_data},
+                            OtherResps++[C];
+                        [C={content, _, _}|_] ->
+                            WorkerPid ! {self(), no_data},
+                            OtherResps++[C];
+                        [] ->
+                            WorkerPid ! {self(), no_data},
+                            OtherResps
+                    end
             end
     end.
 
@@ -378,8 +382,9 @@ get_resp(Hs, WorkerPid) ->
         {WorkerPid, partial_data, Data} ->
             ?Debug("~p~n", [{WorkerPid, partial_data, binary_to_list(Data)}]),
             {Hs, {partial_data, Data}};
-        {WorkerPid, failure, _} ->
-            {[], undef};
+        {WorkerPid, failure, Reason} ->
+            ?Debug("~p~n", [{WorkerPid, failure, Reason}]),
+            {failure, Reason};
         _Other ->
             ?Debug("~p~n", [_Other]),
             get_resp(Hs, WorkerPid)
@@ -630,20 +635,21 @@ fcgi_status_name(?FCGI_STATUS_OVERLOADED) -> "overloaded";
 fcgi_status_name(?FCGI_STATUS_UNKNOWN_ROLE) -> "unknown-role";
 fcgi_status_name(_) -> "?".
 
-%% @@TODO: Make this a total timeout
-%%
--define(FCGI_CONFIG_CONNECT_TIMEOUT_MSECS, 1000).
--define(FCGI_CONFIG_READ_TIMEOUT_MSECS, 1000).
+% Amount of time (in milliseconds) allowed to connect to the application server.
+%
+-define(FCGI_CONNECT_TIMEOUT_MSECS, 10000).
 
+% Amount of time (in milliseconds) allowed for data to arrive when reading the TCP connection to the application server.
+%
+-define(FCGI_READ_TIMEOUT_MSECS, 1000).
 
-%% @@TODO: implement timeout including making it configurable
-%%
+% TODO: Implement a configurable timeout which applies to the whole operation (as oposed to individual socket reads).
+
 -record(fcgi_worker_state, {
             app_server_host,            % The hostname or IP address of the application server
             app_server_port,            % The TCP port number of the application server
             path_info,                  % The path info
             env,                        % All environment variables to be passed to the application (incl the extras)
-            request_timeout,            % Total amount of time (in milliseconds) allowed for a request to be completed
             keep_connection,            % Delegate close authority to the application?
             trace_protocol,             % If true, log info messages for sent and received FastCGI messages
             log_app_error,              % If true, log error messages for application errors (stderr and non-zero exit)
@@ -675,16 +681,17 @@ call_fcgi_responder(Arg, Options) ->
     end.
 
 
-fcgi_worker_fail(WorkerState, Failure) ->
+fcgi_worker_fail(WorkerState, Reason) ->
     ParentPid = WorkerState#fcgi_worker_state.parent_pid,
-    ParentPid ! {failure, Failure},
-    exit(Failure).
+    ParentPid ! {self(), failure, Reason},
+    error_logger:error_msg("FastCGI failure: ~p~n", [Reason]),
+    exit(Reason).
 
 
-fcgi_worker_fail_if(Condition, WorkerState, Failure) ->
+fcgi_worker_fail_if(Condition, WorkerState, Reason) ->
     if 
         Condition ->
-            fcgi_worker_fail(WorkerState, Failure);
+            fcgi_worker_fail(WorkerState, Reason);
         true ->
             ok
     end.
@@ -697,31 +704,30 @@ fcgi_start_worker(Arg, ServerConf, Options) ->
 fcgi_worker(ParentPid, Arg, ServerConf, Options) ->
     AppServerHost = get_opt(app_server_host, Options, ServerConf#sconf.fcgi_app_server_host),
     AppServerPort = get_opt(app_server_port, Options, ServerConf#sconf.fcgi_app_server_port),
-    %% TODO: check valid values for host and port
+    PreliminaryWorkerState = #fcgi_worker_state{parent_pid = ParentPid},
+    fcgi_worker_fail_if(AppServerHost == undefined, PreliminaryWorkerState, app_server_host_must_be_configured),
+    fcgi_worker_fail_if(AppServerPort == undefined, PreliminaryWorkerState, app_server_port_must_be_configured),
     PathInfo = get_opt(path_info, Options, Arg#arg.pathinfo),
-    ScriptFileName = "",                                                %% @@@ TODO: Is this right?
+    ScriptFileName = "",        % There is no script file in the case of FastCGI
     ExtraEnv = get_opt(extra_env, Options, []),
     Env = build_env(Arg, ScriptFileName, PathInfo, ExtraEnv, ServerConf),
-    RequestTimeout = get_opt(request_timeout, Options, 5000),
     TraceProtocol = get_opt(trace_protocol, Options, ?sc_fcgi_trace_protocol(ServerConf)),
     LogAppError = get_opt(trace_protocol, Options, ?sc_fcgi_log_app_error(ServerConf)),
-    AppServerSocket = fcgi_connect_to_application_server(ParentPid, AppServerHost, AppServerPort),
+    AppServerSocket = fcgi_connect_to_application_server(PreliminaryWorkerState, AppServerHost, AppServerPort),
     ?Debug("Start FastCGI worker:~n"
            "  AppServerHost = ~p~n"
            "  AppServerPort = ~p~n"
            "  PathInfo = ~p~n"
            "  ExtraEnv = ~p~n"
-           "  RequestTimeout = ~p~n"
            "  TraceProtocol = ~p~n" 
            "  LogAppStderr = ~p~n", 
-           [AppServerHost, AppServerPort, PathInfo, ExtraEnv, RequestTimeout, TraceProtocol, LogAppError]),
+           [AppServerHost, AppServerPort, PathInfo, ExtraEnv, TraceProtocol, LogAppError]),
     WorkerState = #fcgi_worker_state{
                 app_server_host = AppServerHost,
                 app_server_port = AppServerPort,
                 path_info = PathInfo,
                 env = Env,
                 keep_connection = false,             % Currently hard-coded; make configurable in the future?
-                request_timeout = RequestTimeout,
                 trace_protocol = TraceProtocol,              
                 log_app_error = LogAppError,
                 role = ?FCGI_ROLE_RESPONDER,
@@ -749,11 +755,11 @@ fcgi_pass_through_client_data(WorkerState) ->
     end.
 
 
-fcgi_connect_to_application_server(ParentPid, Host, Port) ->
+fcgi_connect_to_application_server(WorkerState, Host, Port) ->
     Options = [binary, {packet, 0}, {active, false}],
-    case gen_tcp:connect(Host, Port, Options, ?FCGI_CONFIG_CONNECT_TIMEOUT_MSECS) of
-        {error, Reason2} ->
-            fcgi_worker_fail(ParentPid, {connect_to_application_server_failed, Reason2});
+    case gen_tcp:connect(Host, Port, Options, ?FCGI_CONNECT_TIMEOUT_MSECS) of
+        {error, Reason} ->
+            fcgi_worker_fail(WorkerState, {connect_to_application_server_failed, Reason});
         {ok, Socket} ->
             Socket
     end.
@@ -777,12 +783,12 @@ fcgi_send_stdin(WorkerState, Data) ->
     fcgi_send_record(WorkerState, ?FCGI_TYPE_STDIN, ?FCGI_REQUEST_ID_APPLICATION, Data).
 
 
-%% TODO: Not used yet
+%% TODO: @@@ Not used yet
 %% fcgi_send_data(ParentPid, Socket, Data) ->
 %%     fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_DATA, ?FCGI_REQUEST_ID_APPLICATION, Data).
 
 
-%% TODO: Not used yet
+%% TODO: @@@ Not used yet
 %% fcgi_send_abort_request(ParentPid, Socket) ->
 %%     fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_ABORT_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<>>).
 
@@ -915,12 +921,12 @@ fcgi_encode_name_value(Name, Value) when is_list(Name) and is_list(Value) ->
 fcgi_header_loop(WorkerState, Arg) ->
     fcgi_header_loop(WorkerState, Arg, start).
 
-fcgi_header_loop(WorkerState, Arg, LineState) ->            %% TODO: don't need Arg; store arg.pid in worker state as yaws_worker_pid
+fcgi_header_loop(WorkerState, Arg, LineState) ->            %% TODO: @@@ don't need Arg; store arg.pid in worker state as yaws_worker_pid
     Line = fcgi_get_line(WorkerState, LineState),
     ParentPid = WorkerState#fcgi_worker_state.parent_pid,
     case Line of
-        {failure, Failure} ->                           %% TODO: need this?
-            ParentPid ! {self(), failure, Failure};
+        {failure, Reason} ->
+            ParentPid ! {self(), failure, Reason};
         {_EmptyLine = [], NewLineState} ->
             case NewLineState of
                 {middle, Data} ->
@@ -1034,7 +1040,7 @@ fcgi_get_output(WorkerState) ->
 
 
 fcgi_receive_record(WorkerState) ->
-    {ok, Header} = fcgi_receive_binary(WorkerState, 8, ?FCGI_CONFIG_READ_TIMEOUT_MSECS),
+    {ok, Header} = fcgi_receive_binary(WorkerState, 8, ?FCGI_READ_TIMEOUT_MSECS),
     <<Version:8, Type:8, RequestId:16, ContentLength:16, PaddingLength:8, Reserved:8>> = Header, 
     fcgi_worker_fail_if(Version /= 1, WorkerState, {received_unsupported_version, Version}),
     case Type of
@@ -1061,11 +1067,11 @@ fcgi_receive_record(WorkerState) ->
         OtherType ->
             throw({received_unexpected_type, OtherType})
     end,
-    case fcgi_receive_binary(WorkerState, ContentLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
+    case fcgi_receive_binary(WorkerState, ContentLength, ?FCGI_READ_TIMEOUT_MSECS) of
         {error, Reason} ->
             fcgi_worker_fail(WorkerState, {unable_to_read_content_data, Reason});
         {ok, ContentData} ->
-            case fcgi_receive_binary(WorkerState, PaddingLength, ?FCGI_CONFIG_READ_TIMEOUT_MSECS) of
+            case fcgi_receive_binary(WorkerState, PaddingLength, ?FCGI_READ_TIMEOUT_MSECS) of
                 {error, Reason} ->
                     fcgi_worker_fail(WorkerState, {unable_to_read_record_padding_data, Reason});
                 {ok, PaddingData} ->
