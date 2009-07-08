@@ -593,6 +593,19 @@ cgi_add_resp(Bin, Port) ->
 -define(FCGI_TYPE_GET_VALUES_RESULT, 10).
 -define(FCGI_TYPE_UNKNOWN_TYPE, 11).
 
+fcgi_type_name(?FCGI_TYPE_BEGIN_REQUEST) -> "begin-request";
+fcgi_type_name(?FCGI_TYPE_ABORT_REQUEST) -> "abort-request";
+fcgi_type_name(?FCGI_TYPE_END_REQUEST) -> "end-request";
+fcgi_type_name(?FCGI_TYPE_PARAMS) -> "params";
+fcgi_type_name(?FCGI_TYPE_STDIN) -> "stdin";
+fcgi_type_name(?FCGI_TYPE_STDOUT) -> "stdout";
+fcgi_type_name(?FCGI_TYPE_STDERR) -> "stderr";
+fcgi_type_name(?FCGI_TYPE_DATA) -> "data";
+fcgi_type_name(?FCGI_TYPE_GET_VALUES) -> "get_values";
+fcgi_type_name(?FCGI_TYPE_GET_VALUES_RESULT) -> "get_values_result";
+fcgi_type_name(?FCGI_TYPE_UNKNOWN_TYPE) -> "unknown-type";
+fcgi_type_name(_) -> "?".
+
 % The FCGI implementation does not support handling concurrent requests over a connection; it creates a separate 
 % connection for each request. Hence, all application records have the same request-id, namely 1.
 %
@@ -611,10 +624,17 @@ cgi_add_resp(Bin, Port) ->
 -define(FCGI_STATUS_OVERLOADED, 2).
 -define(FCGI_STATUS_UNKNOWN_ROLE, 3).
 
+fcgi_status_name(?FCGI_STATUS_REQUEST_COMPLETE) -> "request-complete";
+fcgi_status_name(?FCGI_STATUS_CANT_MPX_CONN) -> "cannot-multiple-connection";
+fcgi_status_name(?FCGI_STATUS_OVERLOADED) -> "overloaded";
+fcgi_status_name(?FCGI_STATUS_UNKNOWN_ROLE) -> "unknown-role";
+fcgi_status_name(_) -> "?".
+
 %% @@TODO: Make this a total timeout
 %%
 -define(FCGI_CONFIG_CONNECT_TIMEOUT_MSECS, 1000).
 -define(FCGI_CONFIG_READ_TIMEOUT_MSECS, 1000).
+
 
 %% @@TODO: implement timeout including making it configurable
 %%
@@ -626,7 +646,7 @@ cgi_add_resp(Bin, Port) ->
             request_timeout,            % Total amount of time (in milliseconds) allowed for a request to be completed
             keep_connection,            % Delegate close authority to the application?
             trace_protocol,             % If true, log info messages for sent and received FastCGI messages
-            log_app_stderr,             % If true, the application's output to stderr (if any) is logged as an error
+            log_app_error,              % If true, log error messages for application errors (stderr and non-zero exit)
             role,                       % The role of the worker (responder, authenticator, filter)
             parent_pid,                 % The PID of the parent process = the Yaws worker process
             app_server_socket,          % The TCP socket to the FastCGI application server
@@ -684,7 +704,7 @@ fcgi_worker(ParentPid, Arg, ServerConf, Options) ->
     Env = build_env(Arg, ScriptFileName, PathInfo, ExtraEnv, ServerConf),
     RequestTimeout = get_opt(request_timeout, Options, 5000),
     TraceProtocol = get_opt(trace_protocol, Options, ?sc_fcgi_trace_protocol(ServerConf)),
-    LogAppStderr = get_opt(trace_protocol, Options, ?sc_fcgi_log_app_stderr(ServerConf)),
+    LogAppError = get_opt(trace_protocol, Options, ?sc_fcgi_log_app_error(ServerConf)),
     AppServerSocket = fcgi_connect_to_application_server(ParentPid, AppServerHost, AppServerPort),
     ?Debug("Start FastCGI worker:~n"
            "  AppServerHost = ~p~n"
@@ -694,7 +714,7 @@ fcgi_worker(ParentPid, Arg, ServerConf, Options) ->
            "  RequestTimeout = ~p~n"
            "  TraceProtocol = ~p~n" 
            "  LogAppStderr = ~p~n", 
-           [AppServerHost, AppServerPort, PathInfo, ExtraEnv, RequestTimeout, TraceProtocol, LogAppStderr]),
+           [AppServerHost, AppServerPort, PathInfo, ExtraEnv, RequestTimeout, TraceProtocol, LogAppError]),
     WorkerState = #fcgi_worker_state{
                 app_server_host = AppServerHost,
                 app_server_port = AppServerPort,
@@ -703,7 +723,7 @@ fcgi_worker(ParentPid, Arg, ServerConf, Options) ->
                 keep_connection = false,             % Currently hard-coded; make configurable in the future?
                 request_timeout = RequestTimeout,
                 trace_protocol = TraceProtocol,              
-                log_app_stderr = LogAppStderr,
+                log_app_error = LogAppError,
                 role = ?FCGI_ROLE_RESPONDER,
                 parent_pid = ParentPid,      
                 app_server_socket = AppServerSocket       
@@ -767,19 +787,6 @@ fcgi_send_stdin(WorkerState, Data) ->
 %%     fcgi_send_record(ParentPid, Socket, ?FCGI_TYPE_ABORT_REQUEST, ?FCGI_REQUEST_ID_APPLICATION, <<>>).
 
 
-fcgi_type_name(?FCGI_TYPE_BEGIN_REQUEST) -> "begin-request";
-fcgi_type_name(?FCGI_TYPE_ABORT_REQUEST) -> "abort-request";
-fcgi_type_name(?FCGI_TYPE_END_REQUEST) -> "end-request";
-fcgi_type_name(?FCGI_TYPE_PARAMS) -> "params";
-fcgi_type_name(?FCGI_TYPE_STDIN) -> "stdin";
-fcgi_type_name(?FCGI_TYPE_STDOUT) -> "stdout";
-fcgi_type_name(?FCGI_TYPE_STDERR) -> "stderr";
-fcgi_type_name(?FCGI_TYPE_DATA) -> "data";
-fcgi_type_name(?FCGI_TYPE_GET_VALUES) -> "get_values";
-fcgi_type_name(?FCGI_TYPE_GET_VALUES_RESULT) -> "get_values_result";
-fcgi_type_name(?FCGI_TYPE_UNKNOWN_TYPE) -> "unknown-type";
-fcgi_type_name(_) -> "?".
-
 fcgi_data_to_string(Data) ->
     fcgi_data_to_string("", 0, "", "", Data).
 
@@ -836,18 +843,6 @@ fcgi_trace_protocol(WorkerState, Action, Version, Type, RequestId, ContentLength
     end.
 
 
-fcgi_log_error(Log, ProtStatus, AppStatus, StderrData)
-  when (Log == true) 
-  and ((ProtStatus /= ?FCGI_STATUS_REQUEST_COMPLETE) or (AppStatus /= 0) or (StderrData /= <<>>)) ->
-    error_logger:error_msg(
-      "FastCGI application error:~n"
-      "  application-status = ~p~n"
-      "  stderr-output = ~s~n",
-      [AppStatus, fcgi_data_to_string(StderrData)]);
-fcgi_log_error(_Log, _ProtStatus, _AppStatus, _StderrData) ->
-    ok.
-    
-    
 fcgi_send_record(WorkerState, Type, RequestId, NameValueList) ->
     EncodedRecord = fcgi_encode_record(WorkerState, Type, RequestId, NameValueList),
     AppServerSocket = WorkerState#fcgi_worker_state.app_server_socket,
@@ -1000,17 +995,35 @@ fcgi_get_output(WorkerState) ->
     {Type, ContentData} = fcgi_receive_record(WorkerState),
     case Type of
         ?FCGI_TYPE_END_REQUEST ->
-            %% @@TODO: handle non-success prot status
-            <<AppStatus:32, ProtStatus:8, _Reserved:24>> = ContentData,
+            <<AppStatus:32/signed, ProtStatus:8, _Reserved:24>> = ContentData,
             fcgi_worker_fail_if(ProtStatus < ?FCGI_STATUS_REQUEST_COMPLETE, WorkerState, 
                            {received_unknown_protocol_status, ProtStatus}),
             fcgi_worker_fail_if(ProtStatus > ?FCGI_STATUS_UNKNOWN_ROLE, WorkerState,
                            {received_unknown_protocol_status, ProtStatus}),
+            if
+                ProtStatus /= ?FCGI_STATUS_REQUEST_COMPLETE ->
+                    error_logger:error_msg("FastCGI protocol error: ~p (~s)~n", ProtStatus, 
+                                           fcgi_status_name(ProtStatus));
+                true ->
+                    ok
+            end,
+            if
+                (AppStatus /= 0) and (WorkerState#fcgi_worker_state.log_app_error) ->
+                    error_logger:error_msg("FastCGI application non-zero exit status: ~p~n", [AppStatus]);
+                true ->
+                    ok
+            end,
             {exit_status, AppStatus};
         ?FCGI_TYPE_STDOUT ->
             {data, ContentData};
         ?FCGI_TYPE_STDERR ->
-            %% @@TODO: send message for stderr
+            if
+                (ContentData /= <<>>) and (WorkerState#fcgi_worker_state.log_app_error) ->
+                    error_logger:error_msg("FastCGI application stderr output:~s~n", 
+                                           [fcgi_data_to_string(ContentData)]);
+                true ->
+                    ok
+            end,
             fcgi_get_output(WorkerState);
         ?FCGI_TYPE_UNKNOWN_TYPE ->
             <<UnknownType:8, _Reserved:56>> = ContentData,
@@ -1026,19 +1039,24 @@ fcgi_receive_record(WorkerState) ->
     fcgi_worker_fail_if(Version /= 1, WorkerState, {received_unsupported_version, Version}),
     case Type of
         ?FCGI_TYPE_END_REQUEST ->
-            fcgi_worker_fail_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, WorkerState, {unexpected_request_id, RequestId}),
-            fcgi_worker_fail_if(ContentLength /= 8, WorkerState, {incorrect_content_length_for_end_request, ContentLength}),
+            fcgi_worker_fail_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, WorkerState, 
+                                {unexpected_request_id, RequestId}),
+            fcgi_worker_fail_if(ContentLength /= 8, WorkerState, 
+                                {incorrect_content_length_for_end_request, ContentLength}),
             ok;
         ?FCGI_TYPE_STDOUT ->
-            fcgi_worker_fail_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, WorkerState, {unexpected_request_id, RequestId}),
-            %% TODO: @@@ gather for reporting
+            fcgi_worker_fail_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, WorkerState, 
+                                {unexpected_request_id, RequestId}),
             ok;
         ?FCGI_TYPE_STDERR ->
-            fcgi_worker_fail_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, WorkerState, {unexpected_request_id, RequestId}),
+            fcgi_worker_fail_if(RequestId /= ?FCGI_REQUEST_ID_APPLICATION, WorkerState, 
+                                {unexpected_request_id, RequestId}),
             ok;
         ?FCGI_TYPE_UNKNOWN_TYPE ->
-            fcgi_worker_fail_if(RequestId /= ?FCGI_REQUEST_ID_MANAGEMENT, WorkerState, {unexpected_request_id, RequestId}),
-            fcgi_worker_fail_if(ContentLength /= 8, WorkerState, {incorrect_content_length_for_unknown_type, ContentLength}),
+            fcgi_worker_fail_if(RequestId /= ?FCGI_REQUEST_ID_MANAGEMENT, WorkerState, 
+                                {unexpected_request_id, RequestId}),
+            fcgi_worker_fail_if(ContentLength /= 8, WorkerState, 
+                                {incorrect_content_length_for_unknown_type, ContentLength}),
             ok;
         OtherType ->
             throw({received_unexpected_type, OtherType})
