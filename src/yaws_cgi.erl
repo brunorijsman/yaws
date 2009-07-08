@@ -2,9 +2,6 @@
 -author('carsten@codimi.de').
 -author('brunorijsman@hotmail.com').         %% Added support for FastCGI
 
-%% @@@ remove this
--define(debug, true).
-
 -include("../include/yaws_api.hrl").
 -include("yaws_debug.hrl").
 -include("../include/yaws.hrl").
@@ -631,10 +628,12 @@ fcgi_type_name(_) -> "?".
 -define(FCGI_ROLE_AUTHORIZER, 2).
 -define(FCGI_ROLE_FILTER, 3).
 
+-ifdef(debug).   % To avoid compile warning if debug is disabled.
 fcgi_role_name(?FCGI_ROLE_RESPONDER) -> "responder";
 fcgi_role_name(?FCGI_ROLE_AUTHORIZER) -> "authorizer";
 fcgi_role_name(?FCGI_ROLE_FILTER) -> "filter";
 fcgi_role_name(_) -> "?".
+-endif().
 
 -define(FCGI_STATUS_REQUEST_COMPLETE, 0).
 -define(FCGI_STATUS_CANT_MPX_CONN, 1).
@@ -667,6 +666,7 @@ fcgi_status_name(_) -> "?".
             log_app_error,              % If true, log error messages for application errors (stderr and non-zero exit)
             role,                       % The role of the worker (responder, authorizer, filter)
             parent_pid,                 % The PID of the parent process = the Yaws worker process
+            yaws_worker_pid,            % When doing chunked output, stream to this Yaws worker.
             app_server_socket,          % The TCP socket to the FastCGI application server
             stream_to_socket            % The TCP socket to the web browser (stream chunked delivery to this socket) 
         }).
@@ -773,13 +773,14 @@ fcgi_worker(ParentPid, Role, Arg, ServerConf, Options) ->
                 log_app_error = LogAppError,
                 role = Role,
                 parent_pid = ParentPid,      
+                yaws_worker_pid = Arg#arg.pid,
                 app_server_socket = AppServerSocket       
             },
     fcgi_send_begin_request(WorkerState),
     fcgi_send_params(WorkerState, Env),
     fcgi_send_params(WorkerState, []),
     fcgi_pass_through_client_data(WorkerState),
-    fcgi_header_loop(WorkerState, Arg),
+    fcgi_header_loop(WorkerState),
     gen_tcp:close(AppServerSocket),
     ok.
 
@@ -961,10 +962,10 @@ fcgi_encode_name_value(Name, Value) when is_list(Name) and is_list(Value) ->
       (list_to_binary(Value))/binary>>.
 
 
-fcgi_header_loop(WorkerState, Arg) ->
-    fcgi_header_loop(WorkerState, Arg, start).
+fcgi_header_loop(WorkerState) ->
+    fcgi_header_loop(WorkerState, start).
 
-fcgi_header_loop(WorkerState, Arg, LineState) ->            %% TODO: @@@ don't need Arg; store arg.pid in worker state as yaws_worker_pid
+fcgi_header_loop(WorkerState, LineState) ->
     Line = fcgi_get_line(WorkerState, LineState),
     ParentPid = WorkerState#fcgi_worker_state.parent_pid,
     case Line of
@@ -976,7 +977,7 @@ fcgi_header_loop(WorkerState, Arg, LineState) ->            %% TODO: @@@ don't n
                     ParentPid ! {self(), partial_data, Data},
                     receive
                         {ParentPid, stream_data} ->
-                            fcgi_data_loop(WorkerState, Arg#arg.pid);
+                            fcgi_data_loop(WorkerState);
                         {ParentPid, no_data} ->
                             ok
                     end;
@@ -984,14 +985,14 @@ fcgi_header_loop(WorkerState, Arg, LineState) ->            %% TODO: @@@ don't n
                     ParentPid ! {self(), all_data, Data},
                     receive
                         {ParentPid, stream_data} ->
-                            yaws_api:stream_chunk_end(Arg#arg.pid);
+                            yaws_api:stream_chunk_end(WorkerState#fcgi_worker_state.yaws_worker_pid);
                         {ParentPid, no_data} ->
                             ok
                     end
             end;
         {Header, NewLineState} ->
             ParentPid ! {self(), header, Header},
-            fcgi_header_loop(WorkerState, Arg, NewLineState)
+            fcgi_header_loop(WorkerState, NewLineState)
     end.
 
 
@@ -1030,13 +1031,14 @@ fcgi_add_resp(WorkerState, OldData) ->
     end.
 
 
-fcgi_data_loop(WorkerState, StreamToPid) ->
+fcgi_data_loop(WorkerState) ->
+    YawsWorkerPid = WorkerState#fcgi_worker_state.yaws_worker_pid,
     case fcgi_get_output(WorkerState) of 
         {data, Data} ->
-            yaws_api:stream_chunk_deliver_blocking(StreamToPid, Data),
-            fcgi_data_loop(WorkerState, StreamToPid);
+            yaws_api:stream_chunk_deliver_blocking(YawsWorkerPid, Data),
+            fcgi_data_loop(WorkerState);
         {exit_status, _Status} ->
-            yaws_api:stream_chunk_end(StreamToPid)
+            yaws_api:stream_chunk_end(YawsWorkerPid)
     end.
 
 
