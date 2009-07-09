@@ -354,9 +354,6 @@ exeof(F) ->
     [$\., $/|lists:reverse(lists:takewhile(fun notslash/1, lists:reverse(F)))].
 
 
-%% We almost always generate stream content.
-%% Actually, we could do away with `content' altogether.
-
 do_header(_Arg, "Content-type: "++CT, {partial_data, Data}) ->
     {streamcontent, CT, Data};
 do_header(_Arg, "Content-type: "++CT, {all_data, Data}) ->
@@ -633,7 +630,7 @@ fcgi_role_name(?FCGI_ROLE_RESPONDER) -> "responder";
 fcgi_role_name(?FCGI_ROLE_AUTHORIZER) -> "authorizer";
 fcgi_role_name(?FCGI_ROLE_FILTER) -> "filter";
 fcgi_role_name(_) -> "?".
--endif().
+-endif.
 
 -define(FCGI_STATUS_REQUEST_COMPLETE, 0).
 -define(FCGI_STATUS_CANT_MPX_CONN, 1).
@@ -1154,7 +1151,7 @@ fcgi_is_access_allowed(_AnythingElse) ->
 %
 fcgi_extract_variables([Head | Tail]) ->
     fcgi_extract_variables(Head) ++ fcgi_extract_variables(Tail);
-fcgi_extract_variables({head, "Variable-" ++ Rest}) ->
+fcgi_extract_variables({header, "Variable-" ++ Rest}) ->
     [fcgi_split_header(Rest)];
 fcgi_extract_variables(_AnythingElse) ->
     [].
