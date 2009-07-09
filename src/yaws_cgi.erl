@@ -743,7 +743,7 @@ fcgi_worker(ParentPid, Role, Arg, ServerConf, Options) ->
     ExtraEnv = get_opt(extra_env, Options, []),
     Env = build_env(Arg, ScriptFileName, PathInfo, ExtraEnv, ServerConf),
     TraceProtocol = get_opt(trace_protocol, Options, ?sc_fcgi_trace_protocol(ServerConf)),
-    LogAppError = get_opt(trace_protocol, Options, ?sc_fcgi_log_app_error(ServerConf)),
+    LogAppError = get_opt(log_app_error, Options, ?sc_fcgi_log_app_error(ServerConf)),
     AppServerSocket = fcgi_connect_to_application_server(PreliminaryWorkerState, AppServerHost, AppServerPort),
     ?Debug("Start FastCGI worker:~n"
            "  Role = ~p (~s)~n"

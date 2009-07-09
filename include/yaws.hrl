@@ -183,7 +183,7 @@
          arg_rewrite_mod = yaws,
          opaque = [],                 %% useful in embedded mode
          start_mod,                   %% user provided module to be started
-         allowed_scripts = [yaws,php,cgi],
+         allowed_scripts = [yaws,php,cgi,fcgi],
          tilde_allowed_scripts = [],
          revproxy = [],
          soptions = [],
